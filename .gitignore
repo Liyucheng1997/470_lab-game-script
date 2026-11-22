@@ -1,0 +1,8 @@
+.venv/
+data/
+__pycache__/
+# 从游戏文件提取的内容，版权归游戏开发商，由 安装.bat 在本机生成
+tables.json
+game_data.md
+# 本机设置
+assistant.json

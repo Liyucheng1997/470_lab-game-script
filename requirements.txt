@@ -1,0 +1,13 @@
+claude-agent-sdk>=0.2.176
+mss
+pillow
+numpy
+openpyxl
+UnityPy
+winrt-runtime
+winrt-Windows.Foundation
+winrt-Windows.Foundation.Collections
+winrt-Windows.Globalization
+winrt-Windows.Graphics.Imaging
+winrt-Windows.Media.Ocr
+winrt-Windows.Storage.Streams
