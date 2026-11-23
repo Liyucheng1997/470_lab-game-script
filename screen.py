@@ -75,7 +75,22 @@ class Frame:
 
 
 _sct = None
-gdi32 = ctypes.windll.gdi32
+# 截图用自己的一份 DLL 对象并声明好句柄类型（64 位句柄按 int 传会溢出）
+_u32 = ctypes.WinDLL("user32")
+gdi32 = ctypes.WinDLL("gdi32")
+_u32.GetDC.restype = wt.HDC
+_u32.GetDC.argtypes = [wt.HWND]
+_u32.ReleaseDC.argtypes = [wt.HWND, wt.HDC]
+_u32.PrintWindow.argtypes = [wt.HWND, wt.HDC, wt.UINT]
+gdi32.CreateCompatibleDC.restype = wt.HDC
+gdi32.CreateCompatibleDC.argtypes = [wt.HDC]
+gdi32.CreateCompatibleBitmap.restype = wt.HBITMAP
+gdi32.CreateCompatibleBitmap.argtypes = [wt.HDC, ctypes.c_int, ctypes.c_int]
+gdi32.SelectObject.restype = wt.HGDIOBJ
+gdi32.SelectObject.argtypes = [wt.HDC, wt.HGDIOBJ]
+gdi32.GetDIBits.argtypes = [wt.HDC, wt.HBITMAP, wt.UINT, wt.UINT, ctypes.c_void_p, ctypes.c_void_p, wt.UINT]
+gdi32.DeleteObject.argtypes = [wt.HGDIOBJ]
+gdi32.DeleteDC.argtypes = [wt.HDC]
 
 
 class BITMAPINFOHEADER(ctypes.Structure):
@@ -87,12 +102,12 @@ class BITMAPINFOHEADER(ctypes.Structure):
 
 def _print_window(hwnd: int, w: int, h: int) -> Image.Image | None:
     """直接从游戏窗口取画面（PW_RENDERFULLCONTENT），别的窗口挡在上面也不影响。"""
-    hdc = user32.GetDC(hwnd)
+    hdc = _u32.GetDC(hwnd)
     mdc = gdi32.CreateCompatibleDC(hdc)
     bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
     old = gdi32.SelectObject(mdc, bmp)
     try:
-        if not user32.PrintWindow(hwnd, mdc, 3):  # PW_CLIENTONLY | PW_RENDERFULLCONTENT
+        if not _u32.PrintWindow(hwnd, mdc, 3):  # PW_CLIENTONLY | PW_RENDERFULLCONTENT
             return None
         bi = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), w, -h, 1, 32, 0, 0, 0, 0, 0, 0)
         buf = ctypes.create_string_buffer(w * h * 4)
@@ -103,7 +118,7 @@ def _print_window(hwnd: int, w: int, h: int) -> Image.Image | None:
         gdi32.SelectObject(mdc, old)
         gdi32.DeleteObject(bmp)
         gdi32.DeleteDC(mdc)
-        user32.ReleaseDC(hwnd, hdc)
+        _u32.ReleaseDC(hwnd, hdc)
 
 
 def grab(hwnd: int) -> Frame | None:
@@ -306,15 +321,27 @@ def scroll(frame: Frame, fx: float, fy: float, ticks: int):
     time.sleep(0.15)
 
 
-VK = {"tab": 0x09, "esc": 0x1B, "enter": 0x0D, "space": 0x20, "f": 0x46, "c": 0x43}
+VK = {"tab": 0x09, "esc": 0x1B, "enter": 0x0D, "space": 0x20,
+      **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"}, **{str(i): 0x30 + i for i in range(10)}}
+
+
+def _key_input(name: str, up: bool) -> INPUT:
+    vk = VK[name.lower()]
+    scan = user32.MapVirtualKeyW(vk, 0)
+    i = INPUT(type=INPUT_KEYBOARD)
+    i.u.ki = KEYBDINPUT(vk, scan, KEYEVENTF_SCANCODE | (KEYEVENTF_KEYUP if up else 0), 0, 0)
+    return i
+
+
+def key_down(name: str):
+    _send(_key_input(name, False))
+
+
+def key_up(name: str):
+    _send(_key_input(name, True))
 
 
 def key(name: str):
-    vk = VK[name]
-    scan = user32.MapVirtualKeyW(vk, 0)
-    down, up = INPUT(type=INPUT_KEYBOARD), INPUT(type=INPUT_KEYBOARD)
-    down.u.ki = KEYBDINPUT(vk, scan, KEYEVENTF_SCANCODE, 0, 0)
-    up.u.ki = KEYBDINPUT(vk, scan, KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP, 0, 0)
-    _send(down)
+    key_down(name)
     time.sleep(0.05)
-    _send(up)
+    key_up(name)

@@ -138,9 +138,18 @@ OPTION = {
         "relic_focus": PLAN_SCHEMA["properties"]["relic_focus"],
         "how_to_play": {"type": "array", "items": {"type": "string"}, "maxItems": 3, "description": "操作要点，每条不超过 25 字"},
         "challenge_tip": {"type": "string", "description": "挑战怎么选，一句话"},
+        "style": {"type": "string", "enum": ["magic", "physical", "summon"]},
+        "stats": {"type": "string", "description": "属性优先级，如「力量>敏捷>耐力」"},
+        "plan": {"type": "object", "additionalProperties": False, "required": ["early", "mid", "late"],
+                 "description": "长线规划：1~10 波 / 11~20 波 / 21 波后各优先什么，每条不超过 40 字",
+                 "properties": {k: {"type": "string"} for k in ("early", "mid", "late")}},
+        "combat": {"type": "object", "additionalProperties": False, "required": ["engage", "distance"],
+                   "description": "自动战斗：dive 贴脸冲怪堆 / kite 远程拉开 / hold 站桩；distance 为离最近怪的距离（画面宽比例 0~0.35）",
+                   "properties": {"engage": {"type": "string", "enum": ["dive", "kite", "hold"]},
+                                  "distance": {"type": "number"}}},
     },
     "required": ["name", "why_fun", "difficulty", "core_actives", "core_passives", "equip_order", "relic_focus",
-                 "how_to_play", "challenge_tip"],
+                 "how_to_play", "challenge_tip", "style", "stats", "plan", "combat"],
     "additionalProperties": False,
 }
 OPTIONS_SCHEMA = {
@@ -185,6 +194,9 @@ def build_options(hero: str, playstyle: str, model: str, effort: str) -> dict:
             o[k] = _clean(o.get(k, ""))
         o["how_to_play"] = [_clean(x) for x in o.get("how_to_play", [])]
         o["summary"] = f"{o['name']}：{o['why_fun']}"
+        o["tagline"] = o.get("why_fun", "")
+        c = o.get("combat") or {}
+        c["distance"] = min(max(float(c.get("distance", 0.15)), 0.0), 0.35)
     data["chosen"] = 0
     PLAN_DIR.mkdir(parents=True, exist_ok=True)
     (PLAN_DIR / f"{hero}.json").write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")

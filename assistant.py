@@ -1,10 +1,12 @@
-"""地下城竞技场 助手：推荐怎么选、怎么出装，AI 规划本局路线、随时答疑；按 F8 还能切成自动玩。
+"""地下城竞技场 军师：从选英雄开始一路辅助，按 F8 切成自动玩。
 
-推荐模式（默认）：只看不动手。三选一时右边面板给每张卡打分写理由，推荐的那张下面出现 ★；波次之间列出该买什么。
-自动模式（F8）：同样的判断，直接帮你点：选卡、买书买装备买锻造器、用背包、开自动释放、开下一波、输了重试。
-战斗交给游戏自带的「自动战斗 / 自动攻击 / 智能施法」。只模拟鼠标键盘，不改游戏文件、不读写内存。
+- 选英雄：正在看哪个英雄，就讲它的技能怎么用、3 个常见流派（攻略库 knowledge/，秒出）
+- 选地图：讲每个地图 / 难度是什么、适合谁
+- 进游戏：从 3 个流派里挑一个，之后三选一、商店、出装都按这个流派推荐，并按前期 / 中期 / 后期做长线规划
+- 自动玩：选卡、买书买装备买锻造器、开下一波；战斗里自己走位（WASD）、放技能、拾取（combat.py）
 
-快捷键：F8 推荐 / 自动　F7 爽 / 稳　F6 问 AI（看当前画面）　F9 重新规划本局路线　F10 隐藏面板
+只看屏幕、模拟鼠标键盘，不改游戏文件、不读写游戏内存。
+快捷键：F8 推荐 / 自动　F7 爽 / 稳　F6 问 AI（看当前画面）　F9 AI 再配 3 个流派　F10 隐藏面板
 """
 from __future__ import annotations
 
@@ -12,19 +14,21 @@ import ctypes
 import ctypes.wintypes as wt
 import difflib
 import json
+import os
 import queue
 import re
 import sys
 import threading
 import time
-import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 
+import combat
 import screen as S
-from brain import CHALLENGE_DANGER, DANGER_RANK, EQUIP_INFO, STYLE_NAME, TABLES, Brain, fuzzy
+from brain import CHALLENGE_DANGER, DANGER_RANK, STYLE_NAME, TABLES, Brain, base_skill, fuzzy
+from kb import KB
 
 ROOT = Path(__file__).resolve().parent
 LOG = ROOT / "data" / "assistant.log"
@@ -33,13 +37,17 @@ DEFAULTS = {
     "playstyle": "爽",              # 爽 / 稳
     "auto": False,                  # 启动时是否直接自动玩
     "only_carnival": True,          # 自动玩只在狂欢模式里动手（狂欢模式不上排行榜）；推荐模式不受限
+    "auto_move": True,              # 自动玩时自己走位、放技能、拾取（关掉就只交给游戏自带的自动战斗）
+    "hero_key": "q",                # 英雄自带技能的按键（游戏默认：Q 格是英雄技能）
+    "skill_keys": ["e", "r", "t"],  # 学来的三个主动技能
+    "build_pick_seconds": 20,       # 自动玩时开局等你挑流派的秒数，过了就用默认（上次选的 / 第 1 个）
     "buy_equipment": True,
     "buy_books": True,
     "buy_forging": True,
     "gold_reserve": 300,
     "max_forging_per_wave": 10,
     "auto_retry": True,
-    "ai_plan": True,                # 每局开始让 AI 规划路线（几秒到十几秒，后台进行）
+    "ai_plan": True,                # 允许 F9 让 AI 再配流派
     "ai_model": "claude-sonnet-5-5",
     "ai_effort": "low",
     "tick_seconds": 0.6,
@@ -66,8 +74,13 @@ SELECT_1P_BOX = (0.77, 0.11, 0.99, 0.2)        # 右上队伍栏「你·房主 �
 SELECT_BROWSE_BOX = (0.77, 0.54, 0.99, 0.62)   # 右下「当前浏览」的英雄名
 BAG = [(x, y) for y in (0.617, 0.696) for x in (0.882, 0.927, 0.971)]
 EQUIP_SLOTS = [(x, y) for y in (0.858, 0.940) for x in (0.617, 0.661, 0.705)]
-SKILL_SLOTS = [(0.435, 0.873), (0.495, 0.873), (0.556, 0.873)]
-SKILL_KEYS = ("Q", "E", "R")
+SKILL_SLOTS = [(0.435, 0.873), (0.495, 0.873), (0.556, 0.873)]   # E R T（Q 是英雄技能，在 0.375）
+# 三选一卡片右上角的刷新按钮（点一下只换那一张）
+REFRESH_DX, REFRESH_Y = 0.083, 0.233
+# 「请替换一个技能」界面：技能栏变大上移；点要换掉的格子，或点「放弃」
+REPLACE_BOX = (0.36, 0.6, 0.62, 0.67)
+REPLACE_SLOTS = [(0.389, 0.79), (0.469, 0.79), (0.549, 0.79)]
+GIVEUP_BTN = (0.29, 0.63)
 NEUTRAL = (0.62, 0.42)
 SHOP_TABS_BOX = (0.04, 0.09, 0.2, 0.14)
 TAB_EQUIP, TAB_SKILL = (0.079, 0.117), (0.157, 0.117)
@@ -87,6 +100,7 @@ BOOKS = {("D", "active"): (0.093, 0.232), ("D", "passive"): (0.19, 0.232),
 DIGIT_FIX = (("O", "0"), ("o", "0"), ("I", "1"), ("l", "1"), ("|", "1"), ("丨", "1"), ("!", "1"), ("！", "1"))
 KIND_NAME = {"relic": "遗物", "active": "主动技能", "passive": "被动技能", "challenge": "挑战", "attribute": "属性",
              "other": "选项"}
+MAP_NAMES = ("哥布林王国", "亡灵废墟")
 
 user32 = ctypes.windll.user32
 user32.WindowFromPoint.argtypes = [wt.POINT]
@@ -148,6 +162,11 @@ def known_name(text: str) -> str:
     return ""
 
 
+def wave_number(text: str) -> int:
+    m = re.search(r"第\s*(\d+)\s*/", text or "")
+    return int(m.group(1)) if m else 0
+
+
 class Paused(Exception):
     pass
 
@@ -155,19 +174,23 @@ class Paused(Exception):
 # ================================================================ 看、想、动
 
 class Bot:
-    def __init__(self, cfg: dict, publish):
-        self.cfg, self.publish = cfg, publish
+    def __init__(self, cfg: dict, publish, kb: KB):
+        self.cfg, self.publish, self.kb = cfg, publish, kb
         self.brain = Brain(cfg["playstyle"])
         self.auto = bool(cfg["auto"])
         self.hwnd: int | None = None
         self.last_frame: S.Frame | None = None
+        self.scene = "waiting"       # waiting / hero_select / map / prep / battle / choice / result
         self.autocast_tries: dict[int, int] = {}
         self.prepared_wave = ""
         self.prep_logged = ""
         self.hero_hint = ""          # 选英雄界面上选定的英雄，开局读不出名字时用
+        self.browse = ""
         self.last_wave = ""
+        self.map_name = ""           # 「哥布林王国：狂欢1」
         self.mode_ok: bool | None = None
-        self.bad_bag: set[int] = set()
+        self.bad_bag: dict[int, int] = {}   # 背包格 → 用不掉的次数（每波清零）
+        self.last_bag_use = 0.0
         self.owned_equips: list[str] = []
         self.retries = 0
         self.pending_challenge: tuple[str, int] | None = None
@@ -175,6 +198,17 @@ class Bot:
         self.last_choice_key = ""
         self.last_advice_key = ""
         self.ticks = 0
+        self.run_started = 0.0       # 本局开局时间（等你挑流派）
+        self.build_confirmed = False
+        self.peak_pressure = 0.0
+        self.refresh_left: int | None = None   # 三选一剩余刷新次数（None = 不知道）
+        self.refresh_used: set[int] = set()    # 这一屏刷过的卡
+        self.refresh_done = 0
+        self.pending_active = ""               # 技能格满了时刚选的新主动技能，等替换
+        self.slots_scanned = False             # 本局悬停读过技能格了
+        self.replace_tries = 0
+        self.controller: combat.Controller | None = None
+        self.ui_lock = threading.RLock()   # 点鼠标时先把走位的键松开
 
     # ------------------------------------------------ 工具
 
@@ -186,8 +220,10 @@ class Bot:
             fp.write(line + "\n")
         self.publish("log", msg)
 
-    def status(self, msg: str):
-        self.publish("status", msg)
+    def set_scene(self, scene: str):
+        if scene != self.scene:
+            self.scene = scene
+            self.publish("scene", scene)
 
     def frame(self) -> S.Frame:
         self.hwnd = S.find_game()
@@ -207,13 +243,45 @@ class Bot:
         f = self.frame()
         if not S.point_is_game(f, self.hwnd, *pos):
             raise Paused("有别的窗口挡在游戏上面（比如悬浮窗），先不点")
-        S.click(f, pos[0], pos[1], button, double)
-        S.move_to(f, *NEUTRAL)
+        ctl = self.controller
+        if ctl:
+            ctl.release()
+        with (ctl.lock if ctl else self.ui_lock):
+            S.click(f, pos[0], pos[1], button, double)
+            S.move_to(f, *NEUTRAL)
         time.sleep(wait)
 
     def acting(self) -> bool:
         """自动模式且（需要时）确认是狂欢模式，才动手。"""
         return self.auto and (not self.cfg["only_carnival"] or self.mode_ok is not False)
+
+    # ------------------------------------------------ 给战斗线程
+    def combat_ready(self) -> bool:
+        return (self.cfg["auto_move"] and self.acting() and self.scene == "battle"
+                and self.hwnd is not None and S.game_is_foreground(self.hwnd))
+
+    def current_build(self) -> dict:
+        return self.brain.ai_plan or {}
+
+    def combat_profile(self):
+        """(打法, 距离, 是否近战, 技能槽)：流派 + 英雄 + 已学技能。"""
+        hero = self.kb.hero(self.brain.hero) or {}
+        b = self.current_build()
+        c = b.get("combat") or {}
+        melee = hero.get("range", "melee") == "melee"
+        engage = c.get("engage") or ("dive" if melee else "kite")
+        dist = float(c.get("distance", 0.05 if melee else 0.2))
+        slots = []
+        for key, name in zip(self.cfg["skill_keys"], self.brain.actives):
+            note = self.kb.active_note(name)
+            cd = TABLES["active"].get(name, {}).get("cd") or 6.0
+            slots.append(combat.SkillSlot(key, base_skill(name), note.get("auto", "on_cd"), {}, float(cd)))
+        sk = hero.get("skill") or {}
+        auto = dict(sk.get("auto") or {})
+        rule = auto.pop("rule", "passive")
+        if sk.get("kind") == "主动" and rule != "passive":
+            slots.append(combat.SkillSlot(self.cfg["hero_key"], sk.get("name", "英雄技能"), rule, auto, 8.0))
+        return engage, dist, melee, slots
 
     # ------------------------------------------------ 主循环
 
@@ -232,35 +300,49 @@ class Bot:
         f = self.frame()
         self.ticks += 1
         if "选择英雄" in S.ocr_text(f, SELECT_TITLE_BOX, 1.5):
+            self.set_scene("hero_select")
             self.hero_select(f)
+            return
+        if self.scene in ("waiting", "hero_select", "map", "result") and self.ticks % 2 == 0 and self.map_select(f):
             return
         if self.ticks % 3 == 1:
             self.read_chat(f)
         if not self.brain.hero and self.ticks % 8 == 1:  # 兜底：从头像下面读英雄名
             self.set_hero(self.read_hud_hero(f), "头像")
+        if "替换" in S.ocr_text(f, REPLACE_BOX, 1.5):
+            self.set_scene("replace")
+            self.replace_skill(f)
+            return
+        self.replace_tries = 0
         banner = S.ocr_text(f, BANNER, 1.5)
         if self.is_choice(f, banner):
+            self.set_scene("choice")
             self.choose(f, banner)
             return
         self.publish("marker", None)
         self.last_choice_key = ""
+        self.refresh_used, self.refresh_done = set(), 0
         if "知道" in S.ocr_text(f, TUTORIAL_BOX, 1.5):
             if self.acting():
                 self.click(TUTORIAL_BTN)
             return
         result = S.ocr_text(f, RESULT_BOX, 1.0)
         if "失败" in result:
+            self.set_scene("result")
             self.on_defeat(f)
             return
         if "胜利" in result or "通关" in result:
+            self.set_scene("result")
             self.publish("now", {"title": "通关了！", "lines": ["结算、回大厅交给你。下一局选英雄后我接着帮你"]})
             if self.auto:
                 self.auto = False
                 self.publish("mode", None)
             return
         if "开始冒险" in S.ocr_text(f, START_BOX, 1.5):
+            self.set_scene("prep")
             self.between_waves(f)
             return
+        self.set_scene("battle")
         self.in_battle(f)
 
     # ------------------------------------------------ 英雄
@@ -285,19 +367,47 @@ class Bot:
             self.publish("hero", name)
 
     def hero_select(self, f: S.Frame):
-        """选英雄界面：选定了就记下，面板马上给英雄技能和几个流派；还在挑就显示正在看的那个。"""
+        """选英雄界面：正在看哪个英雄就讲哪个；选定了就记下。"""
         picked = self.hero_name(S.ocr_text(f, SELECT_1P_BOX, 1.5))
         if picked:
             self.hero_hint = picked
             if picked != self.brain.hero:
                 self.brain.reset("")  # 换英雄 = 新的一局，清掉上一把的技能和流派
+                self.build_confirmed = False
             self.set_hero(picked, "选英雄界面")
-            self.publish("now", {"title": "选英雄", "lines": [f"已选「{picked}」：下面挑一个流派，然后开始冒险"]})
+            self.publish("now", {"title": f"已选「{picked}」", "tag": "选英雄",
+                                 "lines": ["下面是它的技能玩法和 3 个常见流派，先看看；进游戏后再正式挑一个"]})
             return
         browsing = self.hero_name(S.ocr_text(f, SELECT_BROWSE_BOX, 1.5))
-        if browsing:
+        if browsing and browsing != self.browse:
+            self.browse = browsing
             self.publish("browse", browsing)
-        self.publish("now", {"title": "选英雄", "lines": ["选定英雄后，我先看它的技能，再给几个流派"]})
+        self.publish("now", {"title": "选英雄", "tag": "选英雄",
+                             "lines": ["点到哪个英雄，我就讲它的技能怎么用、常见流派"]})
+
+    # ------------------------------------------------ 选地图
+
+    def map_select(self, f: S.Frame) -> bool:
+        """地图选择界面：整屏粗读一遍，认出地图名和难度就讲解。"""
+        lines = S.ocr(f, (0, 0, 1, 1), 0.6)
+        text = "".join(l.text for l in lines)
+        if not ("地图选择" in text or "关卡/地图" in text or "关卡" in text and any(m in text for m in MAP_NAMES)):
+            return False
+        seen = []
+        for l in lines:
+            for m in MAP_NAMES:
+                if m[:3] in l.text:
+                    d = re.search(r"(难度\s*\d|狂欢\s*\d)", l.text)
+                    seen.append((m, d.group(1).replace(" ", "") if d else ""))
+        for l in lines:   # 单独一行的「难度 3」「狂欢2」
+            d = re.fullmatch(r".{0,3}(难度\s*\d|狂欢\s*\d).{0,3}", l.text)
+            if d:
+                seen.append(("", d.group(1).replace(" ", "")))
+        self.set_scene("map")
+        self.publish("maps", seen)
+        self.publish("now", {"title": "选地图", "tag": "地图",
+                             "lines": ["下面是每张地图 / 难度的说明", "单人爽玩推荐狂欢模式（不上排行榜，自动玩只在狂欢里动手）"]})
+        return True
 
     # ------------------------------------------------ 读聊天框：学了什么技能、选了什么遗物 / 挑战（手动玩时也能跟上）
 
@@ -309,10 +419,16 @@ class Bot:
                     self.mode_ok = True
                 elif "难度" in text:
                     self.mode_ok = False
+                m = re.search(r"((?:哥布林王国|亡灵废墟)[:：]?(?:难度|狂欢)\d)", text)
+                if m and m.group(1) != self.map_name:
+                    self.map_name = m.group(1)
+                    self.publish("map_name", self.map_name)
                 if not self.brain.hero:
                     self.set_hero(self.hero_name(text.split("当前地")[0]), "聊天框")
             if text in self.seen_chat:
                 continue
+            if "刷新次数增加" in text:
+                self.refresh_left = None
             m = re.search(r"学习了(主动|被动)技能(.+)", text)
             if m:
                 kind = "active" if m.group(1) == "主动" else "passive"
@@ -337,22 +453,44 @@ class Bot:
     # ------------------------------------------------ 战斗中
 
     def in_battle(self, f: S.Frame):
-        off = [i for i, p in enumerate(SKILL_SLOTS) if skill_filled(f, p) and not autocast_on(f, p)]
+        ctl = self.controller
+        if ctl and ctl.view and ctl.view.pressure is not None:
+            self.peak_pressure = max(self.peak_pressure, ctl.view.pressure)
+        # 背包满了再捡就浪费：趁身边怪少把东西用掉（长线比多打几下更值）
+        if (self.acting() and time.time() - self.last_bag_use > 8 and self.bag_full(f)
+                and ctl and ctl.view and len(ctl.view.enemies) <= 2 and (ctl.view.hp or 1) > 0.5):
+            self.last_bag_use = time.time()
+            self.log("背包满了，趁怪少先用掉")
+            self.use_bag(limit=6)
+        keys = self.cfg["skill_keys"]
+        off = [i for i, p in enumerate(SKILL_SLOTS) if skill_filled(f, p) and not autocast_on(f, p)
+               and self.wants_autocast(i)]
         if off and self.acting():
             self.ensure_autocast(f)
-        elif off:
-            keys = "、".join(SKILL_KEYS[i] for i in off)
-            self.publish("now", {"title": "战斗中", "lines": [f"{keys} 技能还没开自动释放：右键点一下技能图标"]})
-            return
-        self.publish("now", {"title": "战斗中", "lines": [
-            f"{STYLE_NAME[self.brain.style]} · 已学 {len(self.brain.skills)} 个技能 · {self.brain.playstyle}"]})
+        lines = []
+        if off and not self.acting():
+            lines.append(f"{'、'.join(keys[i].upper() for i in off)} 技能还没开自动释放：右键点一下技能图标")
+        b = self.current_build()
+        lines.append(f"{b.get('name') or STYLE_NAME[self.brain.style]} · 已学 {len(self.brain.skills)} 个技能 · {self.brain.playstyle}")
+        if self.auto and not self.acting():
+            lines.append("非狂欢模式：自动玩不动手（assistant.json 里 only_carnival 可关）")
+        elif self.auto and not self.cfg["auto_move"]:
+            lines.append("自动走位已关：战斗交给游戏自带的自动战斗")
+        self.publish("now", {"title": self.last_wave or "战斗中", "tag": "战斗", "lines": lines})
+
+    def wants_autocast(self, i: int) -> bool:
+        """自动走位时，回血 / 保命 / 变身 / 蓄力这类由我们挑时机放，不开游戏的自动释放。"""
+        if not (self.cfg["auto_move"] and self.acting()) or i >= len(self.brain.actives):
+            return True
+        rule = self.kb.active_note(self.brain.actives[i]).get("auto", "on_cd")
+        return rule not in combat.MANUAL_RULES
 
     def on_defeat(self, f: S.Frame):
         if self.pending_challenge:
             self.brain.challenge_result(False, self.pending_challenge[1])
             self.pending_challenge = None
         if not (self.acting() and self.cfg["auto_retry"]):
-            self.publish("now", {"title": "这波输了", "lines": [
+            self.publish("now", {"title": "这波输了", "tag": "结算", "lines": [
                 "点「从当前波次重试」回到这波准备阶段", "下次挑战我会选保守一点的" if self.brain.playstyle == "爽" else ""]})
             return
         for line in S.ocr(f, (0.1, 0.76, 0.9, 0.86), 1.3):
@@ -382,15 +520,40 @@ class Bot:
             return
         kind = self.brain.infer_kind(banner, cards)
         i = self.brain.pick(kind, cards)
-        key = "|".join(c["matched"] for c in cards) + kind + self.brain.playstyle
+        summary = ""
+        if kind == "active":
+            # 技能格满没满、格子里是什么 → 每张卡写清楚「放进空格 / 替换哪个 / 不值得拿」
+            full = len(self.brain.actives) >= 3 or all(skill_filled(f, p) for p in SKILL_SLOTS)
+            if full and len(self.brain.actives) < 3 and self.acting() and not self.slots_scanned:
+                self.slots_scanned = True
+                names = self.scan_slots(SKILL_SLOTS)
+                if all(names):
+                    for n in names:
+                        self.brain.learn("active", n)
+                    self.brain.actives = list(names)
+                    self.log("认出技能格：" + "、".join(base_skill(n) for n in names))
+            i, summary = self.brain.plan_active_choice(cards, self.brain.actives[:3], self.cfg["skill_keys"], full)
+        for c in cards:
+            n = c.get("matched", "")
+            c["note"] = (self.kb.active_note(n).get("note", "") if kind == "active" else
+                         self.kb.passive_note(n) if kind == "passive" else "")
+        r, r_why = self.brain.refresh_pick(kind, cards, self.refresh_left, self.refresh_used, self.refresh_done)
+        key = "|".join(c["matched"] for c in cards) + kind + self.brain.playstyle + str(r) + str(i)
         if key != self.last_choice_key:
             self.last_choice_key = key
-            self.publish("choice", {"kind": kind, "cards": cards, "best": i})
+            self.publish("choice", {"kind": kind, "cards": cards, "best": i, "summary": summary, "refresh": r,
+                                    "refresh_why": r_why, "refresh_left": self.refresh_left})
             self.publish("marker", i)
         if not self.acting():
             return
+        if r is not None and self.refresh_card(f, r, cards[r], r_why):
+            return            # 刷出了新卡，下一跳重新看
+        if i is None:
+            # 三张都不值得：随便点一张（分最高的），到替换界面点放弃
+            i = max(range(len(cards)), key=lambda j: cards[j]["score"])
+            self.log(f"[主动技能] {summary}")
         c = cards[i]
-        self.log(f"[{KIND_NAME.get(kind, kind)}] 选「{c['matched']}」：{c['why']}")
+        self.log(f"[{KIND_NAME.get(kind, kind)}] 选「{c['matched']}」：{c.get('replace') or c['why']}")
         self.publish("marker", None)
         for y in (CARD_CLICK_Y, 0.33, 0.455):
             self.click((CARD_X[i], y), wait=1.0)
@@ -401,11 +564,104 @@ class Bot:
             self.log("点了卡片没反应，过一会儿再试")
             return
         self.last_choice_key = ""
-        if kind in ("active", "passive", "relic") and c.get("matched"):
+        self.refresh_used, self.refresh_done = set(), 0
+        if kind == "active" and c.get("matched") and len(self.brain.actives) >= 3:
+            self.pending_active = c["matched"]   # 技能格满了：接下来会出「请替换一个技能」
+        elif kind in ("active", "passive", "relic") and c.get("matched"):
             self.brain.learn(kind, c["matched"])
             self.publish("build", None)
         if kind == "challenge":
             self.pending_challenge = (self.last_wave, c.get("danger", 3))
+
+    def refresh_card(self, f: S.Frame, i: int, card: dict, why: str) -> bool:
+        """点第 i 张卡右上角的刷新；卡名变了就算刷成功。"""
+        x0, x1 = CARD_X[i] - CARD_HALF, CARD_X[i] + CARD_HALF
+        old = card.get("matched") or card.get("name")
+        self.click((CARD_X[i] + REFRESH_DX, REFRESH_Y), wait=0.9)
+        f2 = self.frame()
+        new, _ = S.ocr_best(f2, (x0, NAME_Y[0], x1, NAME_Y[1]), known_name)
+        first = not self.refresh_used and self.refresh_done == 0
+        self.refresh_used.add(i)
+        if new and new != old and fuzzy(new, {old: 1}, 0.8) is None:
+            self.refresh_done += 1
+            if self.refresh_left is not None:
+                self.refresh_left = max(self.refresh_left - 1, 0)
+            self.log(f"刷新：{why}（「{old}」→「{new}」）")
+            self.last_choice_key = ""
+            return True
+        if first:
+            self.refresh_left = 0
+            self.log("刷新没反应：刷新次数大概用完了，之后先不刷")
+        return False
+
+    # ------------------------------------------------ 技能格满了：替换还是放弃
+
+    def scan_slots(self, slots) -> list[str | None]:
+        """鼠标依次悬停在技能格上，读说明框里的技能名（军师开之前学的技能，靠这个补上）。"""
+        names = []
+        f = self.frame()
+        for x, y in slots:
+            S.move_to(f, x, y)
+            time.sleep(0.4)
+            f = self.frame()
+            hit = None
+            for line in S.ocr(f, (max(x - 0.16, 0), max(y - 0.42, 0), min(x + 0.26, 1), y - 0.03), 1.3):
+                hit = fuzzy(line.text, TABLES["active"], 0.6)
+                if hit:
+                    break
+            names.append(hit)
+        S.move_to(f, *NEUTRAL)
+        return names
+
+    def replace_skill(self, f: S.Frame):
+        if len(self.brain.actives) < 3 and self.acting() and self.replace_tries == 0:
+            names = self.scan_slots(REPLACE_SLOTS)
+            if all(names):
+                self.brain.actives = []
+                for n in names:
+                    self.brain.learn("active", n)
+                self.brain.actives = list(names)
+                self.log("认出技能格：" + "、".join(f"{k.upper()} {base_skill(n)}" for k, n in zip(self.cfg["skill_keys"], names)))
+        cur = list(self.brain.actives[:3])
+        new = self.pending_active
+        keys = self.cfg["skill_keys"]
+        unknown = len(cur) < 3
+        if unknown:
+            i, why = None, "技能格里有我没记下的技能（可能是开军师前学的），自己决定换哪个"
+        else:
+            i, why = self.brain.replace_pick(new, cur)
+        if i is not None:
+            act = f"把 {keys[i].upper()}「{base_skill(cur[i])}」换成「{base_skill(new)}」"
+        else:
+            act = "点「放弃」，不要新技能"
+        lines = [f"新技能：{base_skill(new) or '没认出来'}"]
+        if cur:
+            lines.append("现有：" + "、".join(f"{keys[j].upper()} {base_skill(n)}" for j, n in enumerate(cur)))
+        if not unknown:
+            lines.append("建议：" + act)
+        lines.append(why)
+        self.publish("now", {"title": "替换技能", "tag": "技能格满了", "lines": lines})
+        if not self.acting():
+            return
+        if unknown and self.replace_tries == 0:
+            self.log("技能格满了，但不清楚格子里是什么：放弃新技能（最稳）")
+        self.replace_tries += 1
+        if self.replace_tries > 4:
+            return    # 点了好几次都没反应：别一直点，交给玩家
+        self.click(REPLACE_SLOTS[i] if i is not None else GIVEUP_BTN, wait=1.0)
+        if "替换" in S.ocr_text(self.frame(), REPLACE_BOX, 1.5):
+            if self.replace_tries == 4:
+                self.log("替换界面点了没反应，请手动点一下")
+            return
+        if i is not None:
+            self.log(f"替换技能：{act}")
+            self.brain.learn("active", new)
+            self.brain.actives[i] = new
+            self.autocast_tries.pop(i, None)
+            self.publish("build", None)
+        else:
+            self.log(f"放弃新技能：{why}")
+        self.pending_active = ""
 
     # ------------------------------------------------ 波次之间
 
@@ -417,10 +673,24 @@ class Bot:
                 self.pending_challenge = None
             if re.search(r"第1/", wave):
                 self.new_run(f)
+            elif self.peak_pressure:
+                self.brain.after_wave(self.peak_pressure)
+                if self.peak_pressure > 0.75:
+                    self.log(f"上一波压力值到过 {self.peak_pressure:.0%}，挑战收一收")
+            self.peak_pressure = 0.0
             self.last_wave = wave
+            self.brain.wave = wave_number(wave) or self.brain.wave
             self.autocast_tries.clear()
+            self.bad_bag.clear()          # 每波重新判断哪些格子用不掉
+            self.publish("build", None)
         self.advise(f, wave)
         if not self.acting():
+            return
+        if not self.build_confirmed:
+            left = self.cfg["build_pick_seconds"] - (time.time() - self.run_started)
+            if left > 0:
+                return    # 等你挑流派
+            self.publish("auto_build", None)
             return
         if wave and wave == self.prepared_wave:
             self.log(f"{wave} 准备完毕，开打")
@@ -441,24 +711,39 @@ class Bot:
         free_skill = sum(not skill_filled(f, p) for p in SKILL_SLOTS)
         free_equip = sum(not filled(f, p) for p in EQUIP_SLOTS)
         bag = sum(filled(f, p) for p in BAG)
-        key = f"{wave}|{skulls}|{gold // 100}|{free_skill}|{free_equip}|{bag}|{self.brain.playstyle}|{self.brain.risk}"
+        key = (f"{wave}|{skulls}|{gold // 100}|{free_skill}|{free_equip}|{bag}|{self.brain.playstyle}|{self.brain.risk}"
+               f"|{self.build_confirmed}|{self.current_build().get('name')}")
         if key == self.last_advice_key:
             return
         self.last_advice_key = key
         tips = self.brain.shop_advice(skulls, gold, free_skill, free_equip, bag, self.owned_equips)
-        off = [SKILL_KEYS[i] for i, p in enumerate(SKILL_SLOTS) if skill_filled(f, p) and not autocast_on(f, p)]
+        b = self.current_build()
+        if b.get("plan"):
+            tips.insert(0, f"长线：{b['plan'][self.brain.stage]}")
+        if b.get("challenge_tip"):
+            tips.insert(len(tips) - 1, f"流派挑战建议：{b['challenge_tip']}")
+        off = [self.cfg["skill_keys"][i].upper() for i, p in enumerate(SKILL_SLOTS)
+               if skill_filled(f, p) and not autocast_on(f, p) and self.wants_autocast(i)]
         if off:
             tips.insert(0, f"{'、'.join(off)} 技能没开自动释放：右键点技能图标")
-        self.publish("now", {"title": f"{wave or '波次之间'} · 准备", "lines": tips})
+        if not self.build_confirmed:
+            tips.insert(0, "先在面板上挑一个流派（点卡片）")
+        self.publish("now", {"title": f"{wave or '波次之间'} · 准备", "tag": "准备", "lines": tips})
 
     def new_run(self, f: S.Frame):
         hero = self.read_hud_hero(f) or self.hero_hint or self.brain.hero
+        plan = self.brain.ai_plan
         self.brain.reset(hero)
+        self.brain.ai_plan = plan if hero and plan else {}
         self.autocast_tries.clear()
         self.bad_bag.clear()
         self.owned_equips.clear()
         self.pending_challenge = None
         self.mode_ok = None
+        self.run_started = time.time()
+        self.build_confirmed = False
+        self.peak_pressure = 0.0
+        self.refresh_left, self.pending_active, self.slots_scanned = None, "", False
         self.log(f"新的一局{('：' + hero) if hero else ''}")
         self.publish("new_run", hero)
 
@@ -474,33 +759,48 @@ class Bot:
             n += 1
         return n
 
-    def use_bag(self):
-        for _ in range(12):
+    def use_bag(self, limit: int = 12):
+        """双击用掉背包里的东西（技能书、锻造器、神符…）。用书引出的三选一、替换技能界面当场处理完再用下一件。"""
+        for _ in range(limit):
             f = self.frame()
+            if "替换" in S.ocr_text(f, REPLACE_BOX, 1.5):
+                self.replace_skill(f)
+                if "替换" in S.ocr_text(self.frame(), REPLACE_BOX, 1.5):
+                    return            # 替换没处理掉：先别再用东西（会一直提示「请先选择一个技能」）
+                continue
             banner = S.ocr_text(f, BANNER, 1.5)
             if self.is_choice(f, banner):
                 self.choose(f, banner)
                 continue
-            slots = [i for i, p in enumerate(BAG) if filled(f, p) and i not in self.bad_bag]
+            slots = [i for i, p in enumerate(BAG) if filled(f, p) and self.bad_bag.get(i, 0) < 2]
             if not slots:
                 return
             i = slots[0]
             self.click(BAG[i], double=True, wait=1.2)
             f2 = self.frame()
-            if not self.is_choice(f2, S.ocr_text(f2, BANNER, 1.5)) and filled(f2, BAG[i]):
-                self.bad_bag.add(i)
+            if ("替换" not in S.ocr_text(f2, REPLACE_BOX, 1.5) and not self.is_choice(f2, S.ocr_text(f2, BANNER, 1.5))
+                    and filled(f2, BAG[i])):
+                self.bad_bag[i] = self.bad_bag.get(i, 0) + 1   # 连续 2 次用不掉才跳过（比如任务道具）
+
+    def bag_full(self, f: S.Frame) -> bool:
+        return all(filled(f, p) for p in BAG)
 
     def ensure_autocast(self, f: S.Frame):
+        """该开的开、该关的关（回血 / 保命 / 变身由自动战斗挑时机放）。"""
         for i, pos in enumerate(SKILL_SLOTS):
-            if not skill_filled(f, pos) or autocast_on(f, pos):
+            if not skill_filled(f, pos):
+                continue
+            want = self.wants_autocast(i)
+            if autocast_on(f, pos) == want:
                 continue
             tries = self.autocast_tries.get(i, 0)
             if tries >= 3:
                 continue
             self.autocast_tries[i] = tries + 1
             self.click(pos, button="right", wait=0.4)
-            if autocast_on(self.frame(), pos):
-                self.log(f"{SKILL_KEYS[i]} 技能开启自动释放")
+            if autocast_on(self.frame(), pos) == want:
+                self.log(f"{self.cfg['skill_keys'][i].upper()} 技能{'开启' if want else '关闭'}自动释放"
+                         + ("" if want else "（留给自动战斗挑时机）"))
 
     # ------------------------------------------------ 商店
 
@@ -534,9 +834,11 @@ class Bot:
             if self.cfg["buy_books"]:
                 self.buy_books(free_skill)
             if self.cfg["buy_equipment"] and free_equip:
-                self.buy_equipment(free_equip)
+                free_equip = self.buy_equipment(free_equip)
             if self.cfg["buy_forging"]:
-                self.buy_forging()
+                # 长线：前中期还有空装备格、核心装备没买齐，就给下一件大件留 2500，不全花在锻造器上
+                saving = free_equip and self.brain.equip_wishlist(self.owned_equips) and self.brain.stage != "late"
+                self.buy_forging(2500 if saving else 0)
         finally:
             self.close_shop()
 
@@ -606,7 +908,7 @@ class Bot:
         return name in text or any(difflib.SequenceMatcher(None, text[i:i + len(name)], name).ratio() >= 0.6
                                    for i in range(max(len(text) - len(name) + 1, 1)))
 
-    def buy_by_position(self, name: str, price: int) -> bool:
+    def buy_by_position(self, name: str, price: int, reserve: int = 0) -> bool:
         idx = SHOP_INDEX.get(name)
         if idx is None or idx // 7 >= len(GRID_Y):
             return False
@@ -615,17 +917,17 @@ class Bot:
             self.log(f"商店里没对上「{name}」的位置，跳过")
             return False
         g0 = self.gold()
-        if g0 < price + self.cfg["gold_reserve"]:
+        if g0 < price + self.cfg["gold_reserve"] + reserve:
             return False
         self.click(pos, button="right", wait=0.7)
         return self.gold() < g0
 
-    def buy_equipment(self, free_equip: int):
+    def buy_equipment(self, free_equip: int) -> int:
         self.click(TAB_EQUIP, wait=0.6)
         S.scroll(self.frame(), 0.25, 0.4, 15)
         for want in self.brain.equip_wishlist(self.owned_equips):
             if free_equip <= 0 or self.gold() < 2500 + self.cfg["gold_reserve"]:
-                return
+                break
             if self.buy_by_position(want, 2500):
                 free_equip -= 1
                 self.owned_equips.append(want)
@@ -634,14 +936,17 @@ class Bot:
                 if self.resolve_choices():
                     self.open_shop()
                     self.click(TAB_EQUIP, wait=0.5)
+        return free_equip
 
-    def buy_forging(self):
+    def buy_forging(self, keep: int = 0):
         self.click(TAB_EQUIP, wait=0.5)
         S.scroll(self.frame(), 0.25, 0.4, 15)
         for _ in range(self.cfg["max_forging_per_wave"]):
             if self.bag_count() >= len(BAG):
                 return
-            if not self.buy_by_position("属性锻造器", 450):
+            if not self.buy_by_position("属性锻造器", 450, keep):
+                if keep:
+                    self.log("金币留着下一波买核心装备")
                 return
             self.log("买了属性锻造器")
             if self.resolve_choices():
@@ -653,18 +958,15 @@ class Bot:
     def context(self) -> str:
         b = self.brain
         return "\n".join([
-            f"英雄：{b.hero or '未知'}；流派：{STYLE_NAME[b.style]}；风格：{b.playstyle}；波次：{self.last_wave or '未知'}",
+            f"英雄：{b.hero or '未知'}；流派：{self.current_build().get('name') or STYLE_NAME[b.style]}；风格：{b.playstyle}；"
+            f"波次：{self.last_wave or '未知'}；地图：{self.map_name or '未知'}",
             f"已学技能：{'、'.join(b.skills) or '无'}",
             f"遗物：{'、'.join(b.relics) or '无'}",
             f"装备：{'、'.join(self.owned_equips) or '未知（手动买的看不到）'}",
         ])
 
 
-# ================================================================ 面板
-
-BG, CARD, FG, DIM, ACCENT, GOOD, WARN, GOLDC = ("#15171c", "#1f2229", "#e8eaed", "#9aa0a6", "#5b9dff",
-                                                "#5fd08a", "#ffb454", "#f5c451")
-FONT = "Microsoft YaHei UI"
+# ================================================================ 快捷键
 
 MODS = {"ctrl": 0x2, "alt": 0x1, "shift": 0x4}
 VKEYS = {f"f{i}": 0x6F + i for i in range(1, 13)}
@@ -679,246 +981,317 @@ def parse_hotkey(spec):
 
 
 def hotkey_thread(bindings: dict, q: queue.Queue):
+    """注册全局快捷键；被占用的每 5 秒重试一次（比如旧的军师还没关，关掉后自动接上）。"""
     names = list(bindings)
+    missing = set()
     for i, name in enumerate(names, 1):
         if not user32.RegisterHotKey(None, i, *parse_hotkey(bindings[name])):
-            q.put(("log", f"快捷键 {bindings[name].upper()} 被占用，去 assistant.json 换一个"))
+            missing.add(i)
+    if missing:
+        keys = "、".join(bindings[names[i - 1]].upper() for i in sorted(missing))
+        q.put(("log", f"快捷键 {keys} 被别的程序占用，会自动重试；一直不行就去 assistant.json 换一个"))
+    user32.SetTimer(None, 0, 5000, None)
     msg = wt.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
         if msg.message == 0x0312:
             q.put(("key", names[msg.wParam - 1]))
+        elif msg.message == 0x0113 and missing:   # WM_TIMER
+            for i in sorted(missing):
+                if user32.RegisterHotKey(None, i, *parse_hotkey(bindings[names[i - 1]])):
+                    missing.discard(i)
+                    q.put(("log", f"快捷键 {bindings[names[i - 1]].upper()} 已可用"))
+
+
+# ================================================================ 面板（ui/ 里的网页，pywebview 显示）
+
+class Api:
+    """网页里 window.pywebview.api.xxx 调到这里。方法都很快返回，真正的事丢回主循环做。"""
+
+    def __init__(self, app: "App"):
+        self._app = app
+
+    def ready(self):
+        self._app.q.put(("ui_ready", None))
+
+    def set_auto(self, on):
+        self._app.q.put(("ui", ("auto", bool(on))))
+
+    def set_style(self, v):
+        self._app.q.put(("ui", ("style", str(v))))
+
+    def choose_build(self, i):
+        self._app.q.put(("ui", ("build", int(i))))
+
+    def ask(self, q):
+        self._app.q.put(("ui", ("ask", str(q))))
+
+    def replan(self):
+        self._app.q.put(("key", "replan"))
+
+    def hide(self):
+        self._app.q.put(("key", "hide"))
+
+    def quit(self):
+        self._app.q.put(("ui", ("quit", None)))
+
+    def reload(self):
+        self._app.q.put(("ui", ("reload", None)))
+
+    def focus_game(self):
+        self._app.panel.focus_game()
 
 
 class App:
     def __init__(self):
+        import panel
         self.cfg = load_cfg()
+        self.kb = KB()
         self.q: queue.Queue = queue.Queue()
-        self.bot = Bot(self.cfg, lambda k, v: self.q.put((k, v)))
+        self.bot = Bot(self.cfg, lambda k, v: self.q.put((k, v)), self.kb)
         if "--auto" in sys.argv:
             self.bot.auto = True
-        self.now = {"title": "等游戏", "lines": ["进游戏后我会自动跟上。三选一、商店、出装都会在这里给建议"]}
+        self.bot.controller = combat.Controller(self.bot)
+        self.panel = panel.Panel(Api(self))
+        self.marker = None
+        self.now = {"title": "等游戏", "tag": "现在", "lines": ["进游戏后我会自动跟上：选英雄、选地图、三选一、商店、战斗都在这里给建议"]}
         self.choice: dict | None = None
-        self.ai_text = ""
-        self.ai_busy = False
-        self.options: dict | None = None     # 当前英雄的几个流派（AI 给的，按英雄缓存）
-        self.options_hero = ""
-        self.options_busy = False
-        self.browse = ""                     # 选英雄界面正在看的英雄
+        self.maps_seen: list | None = None
+        self.ai_text, self.ai_busy = "", False
+        self.ai_options: dict = {}        # 英雄 → AI 配的流派（F9）
+        self.ai_busy_hero = ""
+        self.chosen: dict[str, int] = self._load_choices()
         self.logs: list[str] = []
-        self.status = ""
-        self.visible = True
+        self.status = "启动中"
         self.marker_idx: int | None = None
-        self._build_ui()
+        self.dirty = True
 
-    # ------------------------------------------------ 窗口
+    # ------------------------------------------------ 流派
+    CHOICE_FILE = ROOT / "data" / "build_choice.json"
 
-    def _build_ui(self):
-        prev_fg = user32.GetForegroundWindow()
-        r = self.root = tk.Tk()
-        r.title("地下城助手")
-        r.overrideredirect(True)
-        r.attributes("-topmost", True)
-        r.attributes("-alpha", 0.94)
-        r.configure(bg=BG)
+    def _load_choices(self) -> dict:
+        try:
+            return json.loads(self.CHOICE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
 
-        bar = tk.Frame(r, bg=CARD)
-        bar.pack(fill="x")
-        title = tk.Label(bar, text="⚔ 地下城助手", bg=CARD, fg=FG, font=(FONT, 10, "bold"))
-        title.pack(side="left", padx=8, pady=5)
-        for w in (bar, title):
-            w.bind("<ButtonPress-1>", self._drag_start)
-            w.bind("<B1-Motion>", self._drag_move)
-        close = tk.Label(bar, text="✕", bg=CARD, fg=DIM, font=(FONT, 10), cursor="hand2")
-        close.pack(side="right", padx=8)
-        close.bind("<Button-1>", lambda e: r.destroy())
+    def _save_choices(self):
+        self.CHOICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        self.CHOICE_FILE.write_text(json.dumps(self.chosen, ensure_ascii=False), encoding="utf-8")
 
-        btns = tk.Frame(r, bg=BG)
-        btns.pack(fill="x", padx=6, pady=(6, 2))
-        self.btn_mode = self._button(btns, "", self.toggle_auto)
-        self.btn_style = self._button(btns, "", self.toggle_playstyle)
-        self._button(btns, "问 AI", lambda: self.ask_ai("现在该怎么选、怎么做？"))
-        self.status_lbl = tk.Label(r, text="", bg=BG, fg=DIM, font=(FONT, 8), anchor="w", wraplength=300, justify="left")
-        self.status_lbl.pack(fill="x", padx=8)
+    def hero_shown(self) -> str:
+        b = self.bot
+        return b.brain.hero or b.browse
 
-        bottom = tk.Frame(r, bg=CARD)
-        bottom.pack(side="bottom", fill="x")  # 先放底部输入框，面板高度固定时才不会被挤掉
-        self.entry = tk.Entry(bottom, bg=CARD, fg=DIM, insertbackground=FG, relief="flat", font=(FONT, 9))
-        self.entry.pack(fill="x", padx=8, pady=6)
-        self.entry.insert(0, "问点什么，回车（如：这把出什么装）")
-        self.entry.bind("<FocusIn>", self._entry_focus)
-        self.entry.bind("<Return>", self._entry_send)
+    def builds_for(self, hero: str) -> tuple[list[dict], str]:
+        ai = self.ai_options.get(hero)
+        if ai:
+            return ai.get("options", []), "AI 配的"
+        h = self.kb.hero(hero)
+        if h:
+            return h.get("builds", []), "攻略库"
+        import ai as ai_mod
+        cached = ai_mod.cached_options(hero)
+        return (cached.get("options", []), "AI 配的") if cached else ([], "")
 
-        self.text = tk.Text(r, bg=BG, fg=FG, font=(FONT, 9), wrap="char", relief="flat", padx=8, pady=4,
-                            spacing1=1, spacing3=2, cursor="arrow", highlightthickness=0)
-        self.text.pack(fill="both", expand=True)
-        t = self.text
-        t.tag_configure("sec", font=(FONT, 9, "bold"), foreground=ACCENT, spacing1=6)
-        t.tag_configure("h", font=(FONT, 11, "bold"), foreground=GOOD)
-        t.tag_configure("best", foreground=GOLDC, font=(FONT, 9, "bold"))
-        t.tag_configure("dim", foreground=DIM)
-        t.tag_configure("warn", foreground=WARN)
-        t.tag_configure("opt", foreground=FG)
-
-        self.marker = tk.Toplevel(r)
-        self.marker.overrideredirect(True)
-        self.marker.attributes("-topmost", True)
-        self.marker.configure(bg="#000001")
-        self.marker.attributes("-transparentcolor", "#000001")
-        tk.Label(self.marker, text="▲ 推荐这张", bg="#000001", fg=GOLDC, font=(FONT, 14, "bold")).pack()
-        self.marker.withdraw()
-
-        r.update_idletasks()
-        self.hwnd = user32.GetParent(r.winfo_id()) or r.winfo_id()
-        mh = user32.GetParent(self.marker.winfo_id()) or self.marker.winfo_id()
-        # 标记点不中、不抢焦点（WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW）
-        user32.SetWindowLongW(mh, -20, user32.GetWindowLongW(mh, -20) | 0x80000 | 0x20 | 0x08000000 | 0x80)
-        self.marker_hwnd = mh
-        self.place_panel()
-        # 用 Tk 自己的方式显示（绕过 Tk 直接 ShowWindow 会让它以为窗口是隐藏的，切全屏时又被缩小），显示完把焦点还回去
-        r.deiconify()
-        r.update()
-        if prev_fg:
-            user32.SetForegroundWindow(prev_fg)
-        self.render()
-
-    def _button(self, parent, text, cmd):
-        b = tk.Label(parent, text=text, bg=CARD, fg=FG, font=(FONT, 9), padx=8, pady=3, cursor="hand2")
-        b.pack(side="left", padx=2)
-        b.bind("<Button-1>", lambda e: cmd())
-        return b
-
-    def _drag_start(self, e):
-        self._dx, self._dy = e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y()
-        self._dragged = True
-
-    def _drag_move(self, e):
-        self.root.geometry(f"+{e.x_root - self._dx}+{e.y_root - self._dy}")
-
-    def place_panel(self):
-        """放在游戏画面右侧的空白处（卡片右边、背包上面），不挡三选一和背包。"""
-        if getattr(self, "_dragged", False):
+    def apply_build(self, i: int | None = None, confirm: bool = False):
+        hero = self.bot.brain.hero
+        builds, _ = self.builds_for(hero)
+        if not builds:
             return
-        hwnd = S.find_game()
-        rect = S.game_rect(hwnd) if hwnd else None
-        if rect:
-            x, y, w, h = rect
-            pw, ph = int(w * 0.16), int(h * 0.46)
-            self.root.geometry(f"{pw}x{ph}+{x + int(w * 0.835)}+{y + int(h * 0.095)}")
-            self.status_lbl.configure(wraplength=pw - 16)
-        else:
-            sw = self.root.winfo_screenwidth()
-            self.root.geometry(f"320x520+{sw - 336}+90")
+        if i is None:
+            i = self.chosen.get(hero, 0)
+        i = max(0, min(i, len(builds) - 1))
+        self.chosen[hero] = i
+        self._save_choices()
+        self.bot.brain.ai_plan = builds[i]
+        self.bot.last_choice_key = self.bot.last_advice_key = ""
+        if confirm and not self.bot.build_confirmed:
+            self.bot.build_confirmed = True
+            self.add_log(f"流派：{builds[i]['name']}，开打！")
+        elif confirm:
+            self.add_log(f"流派换成：{builds[i]['name']}")
+        self.dirty = True
 
-    def raise_top(self):
-        if self.visible:
-            user32.SetWindowPos(self.hwnd, -1, 0, 0, 0, 0, 0x2 | 0x1 | 0x10 | 0x40)
-
-    def show_marker(self, idx: int | None):
-        self.marker_idx = idx
-        hwnd = S.find_game()
-        rect = S.game_rect(hwnd) if hwnd else None
-        if idx is None or rect is None or self.bot.auto or not self.visible:
-            self.marker.withdraw()
-            return
-        x, y, w, h = rect
-        self.marker.update_idletasks()
-        mw = self.marker.winfo_reqwidth()
-        self.marker.geometry(f"+{x + int(CARD_X[idx] * w) - mw // 2}+{y + int(0.785 * h)}")
-        user32.ShowWindow(self.marker_hwnd, 4)
-        user32.SetWindowPos(self.marker_hwnd, -1, 0, 0, 0, 0, 0x2 | 0x1 | 0x10 | 0x40)
-
-    # ------------------------------------------------ 渲染
-
-    def render(self):
-        auto = self.bot.auto
-        self.btn_mode.configure(text="● 自动玩" if auto else "○ 推荐", fg=GOOD if auto else FG)
-        self.btn_style.configure(text=f"风格：{self.bot.brain.playstyle}", fg=WARN if self.bot.brain.playstyle == "爽" else ACCENT)
-        self.status_lbl.configure(text=self.status)
-        t = self.text
-        t.configure(state="normal")
-        t.delete("1.0", "end")
-
-        if self.choice:
-            ch = self.choice
-            t.insert("end", f"选{KIND_NAME.get(ch['kind'], '选项')}\n", "sec")
-            for i, c in enumerate(ch["cards"]):
-                star = "★ " if i == ch["best"] else "   "
-                t.insert("end", f"{star}{c['matched'] or '?'}  {c['score']}\n", "best" if i == ch["best"] else "")
-                t.insert("end", f"   {c['why']}\n", "dim")
-        else:
-            t.insert("end", f"{self.now['title']}\n", "sec")
-            for line in self.now["lines"]:
-                if line:
-                    t.insert("end", f"• {line}\n")
-
-        b = self.bot.brain
-        hero = b.hero or self.browse
+    # ------------------------------------------------ 拼面板状态
+    def state(self) -> dict:
+        b = self.bot
+        hero = self.hero_shown()
+        hs = None
         if hero:
-            h = TABLES["hero"].get(hero, {})
-            t.insert("end", f"英雄：{hero}" + ("" if b.hero else "（还在挑）") + "\n", "sec")
-            if h.get("skill"):
-                t.insert("end", f"{h['skill_kind']}「{h['skill']}」：{h.get('skill_info') or h.get('info', '')}\n")
-            if h:
-                t.insert("end", f"成长：力量+{h.get('STRadd')} 敏捷+{h.get('AGIadd')} 耐力+{h.get('STAadd')}"
-                                f"　生命 {h.get('hp')} 法力 {h.get('mp')}\n", "dim")
-        else:
-            t.insert("end", "英雄\n", "sec")
-            t.insert("end", "选好英雄我就给你几个流派\n", "dim")
+            h = self.kb.hero(hero) or {}
+            t = TABLES["hero"].get(hero, {})
+            hs = {"name": hero, "browsing": not b.brain.hero, "role": h.get("role", ""), "range": h.get("range", ""),
+                  "skill": h.get("skill") or ({"name": t.get("skill"), "kind": t.get("skill_kind"),
+                                               "how": t.get("skill_info") or t.get("info", "")} if t else {}),
+                  "tips": h.get("tips", []),
+                  "stats": (f"每级 力量+{t.get('STRadd')} 敏捷+{t.get('AGIadd')} 耐力+{t.get('STAadd')} · "
+                            f"生命 {t.get('hp')} 法力 {t.get('mp')}") if t else ""}
+        builds_state = None
+        if hero:
+            builds, source = self.builds_for(hero)
+            if builds:
+                in_run = b.scene in ("prep", "battle", "choice") and b.brain.hero == hero
+                hint = ""
+                if in_run and not b.build_confirmed:
+                    left = int(self.cfg["build_pick_seconds"] - (time.time() - b.run_started))
+                    hint = ("点一个流派开始" + (f"（自动玩：{left} 秒后用第 {self.chosen.get(hero, 0) + 1} 个）"
+                                          if b.auto and left > 0 else ""))
+                have = [base_skill(s) for s in b.brain.skills]
+                builds_state = {"list": builds, "chosen": self.chosen.get(hero, 0), "confirmed": b.build_confirmed,
+                                "in_run": in_run, "stage": b.brain.stage if in_run else "", "source": source,
+                                "hint": hint, "have": have, "owned": b.owned_equips}
+            elif self.ai_busy_hero == hero:
+                builds_state = {"list": [], "hint": "AI 正在配流派…"}
+        maps = None
+        if b.scene == "map" or (self.maps_seen and b.scene in ("waiting", "hero_select")):
+            maps = self.map_cards()
+        run = None
+        if b.brain.hero and (b.brain.skills or b.brain.relics or b.owned_equips):
+            run = {"skills": b.brain.skills, "relics": b.brain.relics[-6:], "owned": b.owned_equips,
+                   "wish": b.brain.equip_wishlist(b.owned_equips)}
+        ch = None
+        if self.choice and b.scene == "choice":
+            ch = {"kind_name": KIND_NAME.get(self.choice["kind"], "选项"), "best": self.choice["best"],
+                  "refresh": self.choice.get("refresh"), "refresh_why": self.choice.get("refresh_why", ""),
+                  "summary": self.choice.get("summary", ""),
+                  "cards": [{"name": c.get("matched") or c.get("name") or "?", "score": c.get("score", 0),
+                             "why": c.get("why", ""), "note": c.get("note", ""), "replace": c.get("replace", ""),
+                             "worth": c.get("worth", True)} for c in self.choice["cards"]]}
+        ctl = b.controller
+        return {
+            "auto": b.auto, "playstyle": b.brain.playstyle, "status": self.status, "live": bool(b.hwnd),
+            "scene": b.scene, "now": self.now, "hero": hs, "builds": builds_state, "choice": ch, "maps": maps,
+            "map_advice": self.map_advice() if maps else "",
+            "combat": ctl.snapshot() if ctl and b.scene == "battle" else None, "run": run,
+            "ai": {"text": self.ai_text, "busy": self.ai_busy}, "logs": self.logs[-5:],
+        }
 
-        if b.hero:
-            opts = self.options if self.options_hero == b.hero else None
-            if opts:
-                if opts.get("hero_tip"):
-                    t.insert("end", f"{opts['hero_tip']}\n", "dim")
-                t.insert("end", "流派（点一下换）\n", "sec")
-                for i, o in enumerate(opts.get("options", [])):
-                    tag = f"opt{i}"
-                    chosen = i == opts.get("chosen", 0)
-                    mark = "✔" if chosen else "○"
-                    t.insert("end", f"{mark} {i + 1}. {o['name']} · {o['difficulty']}\n", (tag, "best" if chosen else "opt"))
-                    t.insert("end", f"   {o['why_fun']}\n", (tag, "dim"))
-                    if chosen:
-                        t.insert("end", f"   主动：{'、'.join(o['core_actives'])}\n", (tag,))
-                        t.insert("end", f"   被动：{'、'.join(o['core_passives'])}\n", (tag, "dim"))
-                        t.insert("end", f"   出装：{' → '.join(o['equip_order'])}\n", (tag, "dim"))
-                        for tip in o.get("how_to_play", [])[:3]:
-                            t.insert("end", f"   • {tip}\n", (tag, "dim"))
-                        if o.get("challenge_tip"):
-                            t.insert("end", f"   挑战：{o['challenge_tip']}\n", (tag, "dim"))
-                    t.tag_bind(tag, "<Button-1>", lambda e, i=i: self.choose_option(i))
-                    t.tag_bind(tag, "<Enter>", lambda e: t.configure(cursor="hand2"))
-                    t.tag_bind(tag, "<Leave>", lambda e: t.configure(cursor="arrow"))
-            elif self.options_busy:
-                t.insert("end", "流派\n", "sec")
-                t.insert("end", "AI 正在看英雄技能、配流派…（十几秒）\n", "dim")
+    def map_cards(self) -> list[dict]:
+        M = self.kb.maps
+        seen = self.maps_seen or []
+        seen_names = {n for n, _ in seen if n} or {n for n in MAP_NAMES if n in M}
+        cur_diffs = {d for _, d in seen if d}
+        out = []
+        for name in MAP_NAMES:
+            if name not in seen_names or name not in M:
+                continue
+            m = M[name]
+            out.append({"name": name, "diff": "", "line": m.get("theme", "")})
+            table = {**m.get("difficulties", {}), **m.get("carnival", {})}
+            for d, info in table.items():
+                if cur_diffs and d not in cur_diffs:
+                    continue
+                out.append({"name": name, "diff": d, "line": info["line"], "for": info["for"], "tip": info["tip"],
+                            "current": len(cur_diffs) == 1 and d in cur_diffs})
+        return out
 
-        if b.hero and (b.skills or b.relics or self.bot.owned_equips):
-            t.insert("end", "本局\n", "sec")
-            if b.skills:
-                t.insert("end", f"技能：{'、'.join(b.skills)}\n", "dim")
-            if b.relics:
-                t.insert("end", f"遗物：{'、'.join(b.relics[-6:])}\n", "dim")
-            wish = b.equip_wishlist(self.bot.owned_equips)
-            owned = "、".join(f"{e}✓" for e in self.bot.owned_equips)
-            t.insert("end", f"出装：{owned + ('、' if owned and wish else '')}{' → '.join(wish[:4])}\n", "dim")
-        if self.ai_text:
-            t.insert("end", "AI 说\n", "sec")
-            t.insert("end", self.ai_text + "\n")
-        if self.logs:
-            t.insert("end", "刚才\n", "sec")
-            for line in self.logs[-4:]:
-                t.insert("end", f"{line}\n", "dim")
-        t.configure(state="disabled")
-        self.raise_top()
+    def map_advice(self) -> str:
+        b = self.bot
+        h = self.kb.hero(b.brain.hero or b.browse)
+        if not h:
+            return "先选英雄，我再按英雄推荐难度"
+        build = (h.get("builds") or [{}])[self.chosen.get(b.brain.hero or b.browse, 0)]
+        if b.brain.playstyle == "爽":
+            return f"{build.get('name', '')}：推荐狂欢 1 起步，清得动再上狂欢 2 / 3"
+        return f"{build.get('name', '')}：求稳先打难度 1~2 熟悉，再挑战更高难度"
 
-    # ------------------------------------------------ 操作
+    # ------------------------------------------------ 事件
+    def add_log(self, msg: str):
+        self.logs.append(f"{datetime.now():%H:%M} {msg}")
+        self.logs = self.logs[-20:]
+        self.dirty = True
+
+    def handle(self, kind, val):
+        b = self.bot
+        if kind == "status":
+            if val != self.status:
+                self.status = val
+                self.dirty = True
+        elif kind == "log":
+            self.add_log(val)
+        elif kind == "now":
+            self.now = val
+        elif kind == "choice":
+            self.choice = val
+        elif kind == "marker":
+            self.show_marker(val)
+            return
+        elif kind == "scene":
+            if val != "choice":
+                self.choice = None
+        elif kind == "maps":
+            self.maps_seen = val
+        elif kind == "browse":
+            self.ai_text = ""
+        elif kind in ("hero", "new_run"):
+            if kind == "new_run":
+                self.ai_text = ""
+                if b.brain.hero:
+                    self.apply_build()
+                    self.add_log("新的一局：在面板上挑一个流派")
+            elif b.brain.hero:
+                self.apply_build()
+        elif kind == "auto_build":
+            self.apply_build(confirm=True)
+        elif kind == "map_name":
+            self.add_log(f"地图：{val}")
+        elif kind == "options":
+            hero, data = val
+            self.ai_busy_hero = ""
+            self.ai_options[hero] = data
+            self.chosen[hero] = 0
+            if hero == b.brain.hero:
+                self.apply_build(0)
+            self.add_log(f"AI 给 {hero} 配了 {len(data.get('options', []))} 个新流派")
+        elif kind == "options_fail":
+            self.ai_busy_hero = ""
+            self.add_log(f"AI 配流派没成：{str(val)[:40]}")
+        elif kind == "ai_answer":
+            self.ai_text, self.ai_busy = val, False
+        elif kind == "ui_ready":
+            self.panel.ready = True
+            self.panel._last_state = ""
+        elif kind == "ui":
+            self.ui_action(*val)
+        elif kind == "key":
+            {"auto": self.toggle_auto, "playstyle": self.toggle_playstyle,
+             "ask": lambda: self.ask_ai("现在该怎么选、怎么做？"), "replan": self.replan,
+             "hide": self.panel.toggle}[val]()
+        self.dirty = True
+
+    def ui_action(self, what, val):
+        if what == "auto":
+            if val != self.bot.auto:
+                self.toggle_auto()
+        elif what == "style":
+            if val != self.bot.brain.playstyle:
+                self.toggle_playstyle()
+        elif what == "build":
+            hero = self.bot.brain.hero or self.bot.browse
+            if self.bot.brain.hero:
+                self.apply_build(val, confirm=self.bot.scene in ("prep", "battle", "choice"))
+            elif hero:
+                self.chosen[hero] = val
+                self.dirty = True
+        elif what == "ask":
+            self.ask_ai(val)
+        elif what == "quit":
+            self.quit()
+            return
+        elif what == "reload":
+            self.reload()
+            return
+        if what != "ask":
+            self.panel.focus_game()   # 点完把焦点还给游戏
 
     def toggle_auto(self):
-        self.bot.auto = not self.bot.auto
-        self.bot.prepared_wave = ""
-        self.show_marker(None if self.bot.auto else self.marker_idx)
-        self.add_log("切到自动玩：交给我" if self.bot.auto else "切到推荐模式：你来点，我出主意")
-        self.render()
+        b = self.bot
+        b.auto = not b.auto
+        b.prepared_wave = ""
+        if not b.auto and b.controller:
+            b.controller.release()
+        self.show_marker(None if b.auto else self.marker_idx)
+        self.add_log("切到自动玩：选卡、出装、走位、放技能都交给我" if b.auto else "切到推荐模式：你来玩，我出主意")
 
     def toggle_playstyle(self):
         b = self.bot.brain
@@ -926,100 +1299,63 @@ class App:
         save_cfg_key("playstyle", b.playstyle)
         self.bot.last_choice_key = self.bot.last_advice_key = ""
         self.add_log(f"风格：{b.playstyle}" + ("（挑大奖励、高伤害，输了自动收一收）" if b.playstyle == "爽" else "（求稳，挑战只接最安全的）"))
-        self.render()
 
-    def add_log(self, msg: str):
-        self.logs.append(f"{datetime.now():%H:%M} {msg}")
-        self.logs = self.logs[-20:]
-
-    def _entry_focus(self, _):
-        if self.entry.cget("fg") == DIM:
-            self.entry.delete(0, "end")
-            self.entry.configure(fg=FG)
-
-    def _entry_send(self, _=None):
-        q = self.entry.get().strip()
-        if not q or self.entry.cget("fg") == DIM:
+    def replan(self):
+        hero = self.bot.brain.hero or self.bot.browse
+        if not hero or not self.cfg["ai_plan"] or self.ai_busy_hero:
             return
-        self.entry.delete(0, "end")
-        self.ask_ai(q)
-        hwnd = S.find_game()
-        if hwnd:
-            user32.SetForegroundWindow(hwnd)  # 问完把焦点还给游戏
+        self.ai_busy_hero = hero
+        self.add_log(f"让 AI 给 {hero} 再配 3 个流派（十几秒）")
+        playstyle = self.bot.brain.playstyle
+
+        def work():
+            import ai
+            try:
+                self.q.put(("options", (hero, ai.build_options(hero, playstyle, self.cfg["ai_model"], self.cfg["ai_effort"]))))
+            except Exception as e:
+                self.q.put(("options_fail", str(e)))
+        threading.Thread(target=work, daemon=True).start()
 
     def ask_ai(self, question: str):
         if self.ai_busy:
             return
         self.ai_busy = True
-        self.ai_text = f"（想一下：{question}）"
-        self.render()
+        self.ai_text = f"想一下：{question}"
+        self.dirty = True
         hwnd = S.find_game()
         frame = S.grab(hwnd) if hwnd else None
         ctx = self.bot.context()
         if self.choice:
-            ctx += "\n当前三选一：" + "；".join(f"{c['matched']}（{c['why']}）" for c in self.choice["cards"])
+            ctx += "\n当前三选一：" + "；".join(f"{c.get('matched')}（{c.get('why')}）" for c in self.choice["cards"])
 
         def work():
             import ai
             try:
                 png = ai.png_bytes(frame.img) if frame else None
-                ans = ai.answer(question, png, ctx, self.cfg["ai_model"], self.cfg["ai_effort"])
-                self.q.put(("ai_answer", ans))
+                self.q.put(("ai_answer", ai.answer(question, png, ctx, self.cfg["ai_model"], self.cfg["ai_effort"])))
             except Exception as e:
                 self.q.put(("ai_answer", f"没问成：{e}"))
         threading.Thread(target=work, daemon=True).start()
 
-    def load_options(self, hero: str, force: bool = False):
-        """英雄定下来后：有缓存直接用，没有就让 AI 看英雄技能配 3 个流派。"""
-        if not hero or not self.cfg["ai_plan"]:
+    # ------------------------------------------------ 推荐标记
+    def show_marker(self, idx: int | None):
+        self.marker_idx = idx
+        if self.marker is None:
             return
-        import ai
-        if not force and self.options_hero == hero and self.options:
-            self.apply_option()
-            return
-        cached = None if force else ai.cached_options(hero)
-        if cached:
-            self.options, self.options_hero = cached, hero
-            self.apply_option()
-            return
-        if self.options_busy:
-            return
-        self.options_busy, self.options_hero, self.options = True, hero, None
-        playstyle = self.bot.brain.playstyle
-
-        def work():
-            try:
-                data = ai.build_options(hero, playstyle, self.cfg["ai_model"], self.cfg["ai_effort"])
-                self.q.put(("options", (hero, data)))
-            except Exception as e:
-                self.q.put(("options_fail", str(e)))
-        threading.Thread(target=work, daemon=True).start()
-
-    def apply_option(self):
-        """选中的流派交给 brain：推荐和自动玩都按它加分、按它出装。"""
-        if not self.options or self.options_hero != self.bot.brain.hero:
-            return
-        opts = self.options.get("options", [])
-        i = min(self.options.get("chosen", 0), len(opts) - 1)
-        if i >= 0:
-            self.bot.brain.ai_plan = opts[i]
-            self.bot.last_choice_key = self.bot.last_advice_key = ""
-
-    def choose_option(self, i: int):
-        if not self.options:
-            return
-        import ai
-        self.options["chosen"] = i
-        ai.save_choice(self.options_hero, self.options)
-        self.apply_option()
-        self.add_log(f"流派换成：{self.options['options'][i]['name']}")
-        self.render()
         hwnd = S.find_game()
-        if hwnd:
-            user32.SetForegroundWindow(hwnd)  # 点完把焦点还给游戏
+        rect = S.game_rect(hwnd) if hwnd else None
+        if idx is None or rect is None or self.bot.auto or not self.panel.visible:
+            self.marker.hide()
+            return
+        import marker
+        x, y, w, h = rect
+        f = self.bot.last_frame
+        cx, cy = CARD_X[idx], 0.785
+        back = f.crop(cx - 0.06, cy - 0.025, cx + 0.06, cy + 0.025) if f else None
+        img = marker.render_pill("★ 推荐这张", back, user32.GetDpiForSystem() / 96)
+        self.marker.show(x + int(cx * w), y + int(cy * h), img)
 
     # ------------------------------------------------ 循环
-
     def worker(self):
         while True:
             try:
@@ -1031,95 +1367,111 @@ class App:
             except Exception as e:
                 self.bot.log(f"出错：{type(e).__name__}: {e}")
                 time.sleep(1)
+            self.panel.backdrop(self.bot.last_frame)
             time.sleep(self.cfg["tick_seconds"])
 
-    def poll(self):
-        changed = False
+    def pump(self):
+        last_place = 0.0
+        while True:
+            try:
+                while True:
+                    self.handle(*self.q.get(timeout=0.15))
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print("面板事件出错：", e)
+            now = time.time()
+            if self.bot.scene == "battle" or (not self.bot.build_confirmed and self.bot.scene == "prep"):
+                self.dirty = True     # 战斗数据、倒计时要刷新
+            try:   # 单次出错只记一下，不能让刷新线程停掉（停了面板就一直卡在旧内容）
+                if self.dirty:
+                    self.dirty = False
+                    self.panel.push(self.state())
+                if now - last_place > 3:
+                    last_place = now
+                    self.panel.place()
+                    self.panel.keep_on_top()
+            except Exception as e:
+                self.bot.log(f"面板刷新出错：{type(e).__name__}: {e}")
+                time.sleep(1)
+
+    def on_start(self):
+        import marker
+        self.panel.on_shown()
         try:
-            while True:
-                kind, val = self.q.get_nowait()
-                changed = True
-                if kind == "status":
-                    if val == self.status:
-                        changed = False
-                    self.status = val
-                elif kind == "log":
-                    self.add_log(val)
-                elif kind == "now":
-                    self.now, self.choice = val, None
-                elif kind == "choice":
-                    self.choice = val
-                elif kind == "marker":
-                    if val != self.marker_idx or val is None:
-                        self.show_marker(val)
-                    changed = False
-                elif kind == "build" or kind == "mode":
-                    pass
-                elif kind == "browse":
-                    if val == self.browse:
-                        changed = False
-                    self.browse = val
-                elif kind in ("hero", "new_run"):
-                    if kind == "new_run":
-                        self.ai_text = ""
-                    self.browse = ""
-                    self.load_options(val)
-                elif kind == "options":
-                    hero, data = val
-                    self.options_busy = False
-                    if hero == self.bot.brain.hero:
-                        self.options, self.options_hero = data, hero
-                        self.apply_option()
-                        self.add_log(f"{hero} 的 {len(data.get('options', []))} 个流派好了，默认第 1 个，点一下可换")
-                elif kind == "options_fail":
-                    self.options_busy = False
-                    self.add_log(f"AI 配流派没成：{val[:40]}")
-                elif kind == "ai_answer":
-                    self.ai_text, self.ai_busy = val, False
-                elif kind == "key":
-                    {"auto": self.toggle_auto, "playstyle": self.toggle_playstyle,
-                     "ask": lambda: self.ask_ai("现在该怎么选、怎么做？"), "replan": lambda: self.load_options(self.bot.brain.hero, force=True),
-                     "hide": self.toggle_hide}[val]()
-        except queue.Empty:
-            pass
-        if changed:
-            self.render()
-        self.root.after(150, self.poll)
-
-    def toggle_hide(self):
-        self.visible = not self.visible
-        if self.visible:
-            self.restore_panel()
-        else:
-            self.root.withdraw()
-            self.marker.withdraw()
-
-    def restore_panel(self):
-        """用 Tk 的 deiconify 恢复，然后把焦点还给原来的窗口（通常是游戏）。"""
-        fg = user32.GetForegroundWindow()
-        self.root.deiconify()
-        self.root.update_idletasks()
-        if fg and fg != self.hwnd:
-            user32.SetForegroundWindow(fg)
-
-    def follow_game(self):
-        # 游戏切全屏时可能把面板一起最小化（左下角变成一个小标题条），发现了就恢复
-        if self.visible and (user32.IsIconic(self.hwnd) or self.root.state() != "normal"):
-            self.restore_panel()
-        self.place_panel()
-        self.raise_top()
-        self.root.after(3000, self.follow_game)
-
-    def run(self):
-        threading.Thread(target=self.worker, daemon=True).start()
-        threading.Thread(target=hotkey_thread, args=(self.cfg["hotkeys"], self.q), daemon=True).start()
+            self.marker = marker.Marker()
+        except Exception as e:
+            print("推荐标记窗口没建起来：", e)
+        threading.Thread(target=self.worker, daemon=True, name="bot").start()
+        threading.Thread(target=hotkey_thread, args=(self.cfg["hotkeys"], self.q), daemon=True, name="hotkeys").start()
         if "--debug" in sys.argv:
             import faulthandler
             faulthandler.dump_traceback_later(20, repeat=True, file=open(ROOT / "data" / "stacks.txt", "w"))
-        self.poll()
-        self.follow_game()
-        self.root.mainloop()
+        self.pump()
+
+    def quit(self):
+        if self.bot.controller:
+            self.bot.controller.running = False
+            self.bot.controller.release()
+        if self.marker:
+            self.marker.hide()
+        self.panel.window.destroy()
+        threading.Timer(3, lambda: os._exit(0)).start()   # WebView 偶尔关不干净，兜底退出
+
+    def reload(self):
+        """重新加载：先起一个新的军师（读磁盘上最新的代码），自己马上退出。新进程会等旧进程放开单实例锁。"""
+        import subprocess
+        args = [a for a in sys.argv[1:] if a not in ("--auto", "--reload")]
+        args.append("--reload")
+        if self.bot.auto:
+            args.append("--auto")          # 自动玩状态带过去
+        self.add_log("重新加载中…")
+        release_instance()
+        exe = Path(sys.executable)
+        if exe.name.lower() == "python.exe" and exe.with_name("pythonw.exe").exists():
+            exe = exe.with_name("pythonw.exe")     # 不弹黑框
+        subprocess.Popen([str(exe), str(Path(__file__).resolve()), *args], cwd=str(ROOT),
+                         creationflags=0x00000008 | 0x00000200)   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+        self.quit()
+
+    def run(self):
+        import webview
+        webview.start(self.on_start, debug="--devtools" in sys.argv)
+
+
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_k32.CreateMutexW.restype = wt.HANDLE
+_k32.CreateMutexW.argtypes = [ctypes.c_void_p, wt.BOOL, wt.LPCWSTR]
+_k32.CloseHandle.argtypes = [wt.HANDLE]
+_MUTEX = None
+MUTEX_NAME = "DungeonBrawlAdvisor.SingleInstance"
+
+
+def single_instance(wait: float = 0.0) -> bool:
+    """只允许开一个军师：两个同时跑会抢键盘鼠标、抢快捷键。wait：重新加载时等旧进程退出的秒数。"""
+    global _MUTEX
+    deadline = time.time() + wait
+    while True:
+        _MUTEX = _k32.CreateMutexW(None, False, MUTEX_NAME)
+        if ctypes.get_last_error() != 183:   # ERROR_ALREADY_EXISTS
+            return True
+        _k32.CloseHandle(_MUTEX)
+        _MUTEX = None
+        if time.time() >= deadline:
+            break
+        time.sleep(0.2)
+    user32.MessageBoxW(None, "地下城军师已经在运行了。\n按 F10 显示面板；要载入新版本点面板右上角 ↻。",
+                       "地下城军师", 0x40 | 0x40000)
+    return False
+
+
+def release_instance():
+    global _MUTEX
+    if _MUTEX:
+        _k32.CloseHandle(_MUTEX)
+        _MUTEX = None
 
 
 if __name__ == "__main__":
-    App().run()
+    if single_instance(wait=10.0 if "--reload" in sys.argv else 0.0):
+        App().run()

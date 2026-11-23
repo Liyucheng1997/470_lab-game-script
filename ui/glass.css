@@ -1,0 +1,214 @@
+/* 液态玻璃（Liquid Glass）设计变量与材质
+ * 来源：琉璃 Obsidian 主题插件（427）+ 我的 AI Bot 灵动岛（417），统一后的版本。
+ * 用法：最先引入；组件只引用这里的变量。默认深色（游戏 / 视频上的悬浮层），浅色用 <html data-theme="light">。
+ *
+ * 四层结构：
+ *   L0 背景     --backdrop：身后画面的模糊截图（桌面浮窗截不到身后的东西，由程序截好塞进来）
+ *   L1 框架玻璃  .lg-frame：整块面板，重染色 + 顶部高光
+ *   L3 浮层玻璃  .lg-card：面板里的卡片，薄染色 + 渐变高光边 + 内高光
+ *   L4 控件     .lg-pill / .lg-seg：胶囊按钮、分段控件，按下液体回弹
+ * 铁律：玻璃里不再嵌大面积玻璃；文字下面的玻璃不透明度 ≥ 55%；只有一个强调色。
+ */
+:root {
+  /* 背景（L0） */
+  --backdrop: none;
+  --backdrop-fallback: radial-gradient(120% 80% at 20% 0%, #3a3550 0%, transparent 60%),
+                       radial-gradient(100% 70% at 100% 100%, #3b2a1e 0%, transparent 60%);
+  --backdrop-color: #14141a;
+
+  /* 墨黑玻璃 */
+  --lg-tint: 18, 18, 22;           /* 染色 RGB */
+  --lg-frame-alpha: .40;           /* L1：只铺一层时文字下 ≥ 40%，配合文字阴影 */
+  --lg-card-alpha: .32;            /* L3：叠在 L1 上，合起来约 60% */
+  --lg-card-alpha-hi: .52;
+  --lg-blur: 18px;
+  --lg-saturate: 1.6;
+
+  /* 高光与阴影 */
+  --lg-rim: inset 0 1px 0 rgba(255, 255, 255, .20), inset 0 -1px 0 rgba(255, 255, 255, .04);
+  --lg-edge-hi: rgba(255, 255, 255, .55);   /* 渐变边：左上亮 */
+  --lg-edge-lo: rgba(255, 255, 255, .06);   /* 中段几乎透明 */
+  --lg-edge-re: rgba(255, 255, 255, .22);   /* 右下一点反光 */
+  --lg-drop: 0 10px 30px rgba(0, 0, 0, .38), 0 2px 6px rgba(0, 0, 0, .25);
+  --lg-sheen: linear-gradient(180deg, rgba(255, 255, 255, .10), rgba(255, 255, 255, 0) 42%);
+
+  /* 文字 */
+  --text: #f5f5f7;
+  --text-2: rgba(235, 235, 245, .72);
+  --text-3: rgba(235, 235, 245, .48);
+  --line: rgba(255, 255, 255, .10);
+  --hover: rgba(255, 255, 255, .07);
+  --active: rgba(255, 255, 255, .12);
+
+  /* 唯一强调色 + 状态色 */
+  --accent: #ffb340;
+  --accent-ink: #1d1d1f;
+  --accent-soft: rgba(255, 179, 64, .16);
+  --accent-ring: rgba(255, 179, 64, .45);
+  --good: #30d158;
+  --warn: #ff9f0a;
+  --bad: #ff453a;
+  --info: #64d2ff;
+
+  /* 形状 */
+  --r-xl: 22px;
+  --r-lg: 16px;
+  --r-md: 12px;
+  --r-sm: 8px;
+  --r-pill: 999px;
+
+  /* 动效 */
+  --spring: cubic-bezier(.34, 1.56, .64, 1);
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  --mono: "SF Mono", ui-monospace, Consolas, monospace;
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --lg-tint: 250, 250, 252;
+  --lg-frame-alpha: .62;
+  --lg-card-alpha: .55;
+  --lg-card-alpha-hi: .72;
+  --lg-rim: inset 0 1px 0 rgba(255, 255, 255, .85), inset 0 -1px 0 rgba(255, 255, 255, .25);
+  --lg-edge-hi: rgba(255, 255, 255, .95);
+  --lg-edge-lo: rgba(255, 255, 255, .25);
+  --lg-edge-re: rgba(255, 255, 255, .6);
+  --lg-drop: 0 10px 30px rgba(0, 0, 0, .10), 0 2px 6px rgba(0, 0, 0, .06);
+  --lg-sheen: linear-gradient(180deg, rgba(255, 255, 255, .5), rgba(255, 255, 255, 0) 45%);
+  --text: #1d1d1f;
+  --text-2: #4a4a4f;
+  --text-3: #86868b;
+  --line: rgba(0, 0, 0, .08);
+  --hover: rgba(0, 0, 0, .04);
+  --active: rgba(0, 0, 0, .08);
+  --accent: #d97a00;
+  --accent-ink: #fff;
+  --accent-soft: rgba(255, 149, 0, .14);
+  --accent-ring: rgba(255, 149, 0, .4);
+  color-scheme: light;
+}
+
+/* ---------------------------------------------------------------- L0 背景 */
+html, body { margin: 0; height: 100%; overflow: hidden; }
+html { background: var(--backdrop-color); }   /* body 不能有底色：会盖住 z-index 为负的背景层 */
+body {
+  font: 13px/1.5 var(--font);
+  letter-spacing: -.005em;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, .35);   /* 身后是亮场景时也看得清 */
+}
+:root[data-theme="light"] body { text-shadow: none; }
+.lg-backdrop {
+  position: fixed; inset: -24px; z-index: -2;
+  background-color: var(--backdrop-color);
+  background-image: var(--backdrop), var(--backdrop-fallback);   /* 图片列表里不能放纯色，否则整条失效 */
+  background-size: cover; background-position: center;
+  filter: blur(14px) saturate(var(--lg-saturate)) brightness(1.05);
+  transform: scale(1.06);
+  transition: background-image .6s linear;
+}
+
+/* ---------------------------------------------------------------- L1 框架玻璃 */
+.lg-frame {
+  position: fixed; inset: 0; z-index: -1;
+  background: var(--lg-sheen), rgba(var(--lg-tint), var(--lg-frame-alpha));
+  box-shadow: var(--lg-rim);
+}
+
+/* ---------------------------------------------------------------- L3 浮层玻璃（卡片） */
+.lg-card {
+  position: relative;
+  background: var(--lg-sheen), rgba(var(--lg-tint), var(--lg-card-alpha));
+  backdrop-filter: blur(var(--lg-blur)) saturate(var(--lg-saturate));
+  border-radius: var(--r-lg);
+  box-shadow: var(--lg-rim), var(--lg-drop);
+  isolation: isolate;
+}
+/* 渐变高光边：1px 描边，左上亮、中段透明、右下一点反光（玻璃感的关键，比模糊更重要） */
+.lg-card::before, .lg-pill::before, .lg-seg::before {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; padding: 1px; pointer-events: none;
+  background: linear-gradient(155deg, var(--lg-edge-hi), var(--lg-edge-lo) 38%, var(--lg-edge-lo) 62%, var(--lg-edge-re));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor; mask-composite: exclude;
+}
+.lg-card.hi { background: var(--lg-sheen), rgba(var(--lg-tint), var(--lg-card-alpha-hi)); }
+/* 选中 / 推荐：强调色淡染 + 外发光圈 */
+.lg-card.is-accent {
+  background: var(--lg-sheen), linear-gradient(var(--accent-soft), var(--accent-soft)), rgba(var(--lg-tint), var(--lg-card-alpha-hi));
+  box-shadow: var(--lg-rim), 0 0 0 1px var(--accent-ring), 0 8px 28px rgba(255, 159, 10, .18);
+}
+
+/* ---------------------------------------------------------------- L4 控件 */
+.lg-pill {
+  position: relative; display: inline-flex; align-items: center; gap: 6px;
+  height: 28px; padding: 0 12px; border: 0; border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, .08); color: var(--text);
+  font: 500 12px/1 var(--font); cursor: pointer; white-space: nowrap;
+  box-shadow: var(--lg-rim);
+  transition: transform .25s var(--spring), background .15s;
+}
+.lg-pill:hover { background: rgba(255, 255, 255, .14); }
+.lg-pill:active { transform: scale(.94); }
+.lg-pill.primary { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.lg-pill.primary::before { opacity: .5; }
+.lg-pill.icon { width: 28px; padding: 0; justify-content: center; }
+
+.lg-seg {
+  position: relative; display: inline-grid; grid-auto-flow: column; grid-auto-columns: 1fr;
+  padding: 2px; border-radius: var(--r-pill); background: rgba(0, 0, 0, .25);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, .35);
+}
+.lg-seg button {
+  position: relative; z-index: 1; height: 24px; padding: 0 10px; border: 0; background: none;
+  color: var(--text-2); font: 500 12px/1 var(--font); border-radius: var(--r-pill); cursor: pointer;
+  transition: color .2s;
+}
+.lg-seg button.on { color: var(--accent-ink); }
+.lg-seg .thumb {
+  position: absolute; z-index: 0; top: 2px; bottom: 2px; border-radius: var(--r-pill);
+  background: var(--accent); box-shadow: 0 2px 8px rgba(0, 0, 0, .3), inset 0 1px 0 rgba(255, 255, 255, .45);
+  transition: left .35s var(--spring), width .35s var(--spring);
+}
+
+.lg-chip {
+  display: inline-flex; align-items: center; height: 20px; padding: 0 8px; border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, .08); color: var(--text-2); font-size: 11.5px; white-space: nowrap;
+  box-shadow: inset 0 0 0 .5px rgba(255, 255, 255, .12);
+}
+.lg-chip.accent { background: var(--accent-soft); color: var(--accent); box-shadow: inset 0 0 0 .5px var(--accent-ring); }
+.lg-chip.good { background: rgba(48, 209, 88, .14); color: var(--good); }
+.lg-chip.bad { background: rgba(255, 69, 58, .14); color: var(--bad); }
+
+.lg-input {
+  width: 100%; height: 34px; padding: 0 14px; border: 0; outline: 0; border-radius: var(--r-pill);
+  background: rgba(0, 0, 0, .28); color: var(--text); font: 13px var(--font);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, .4), 0 0 0 1px var(--line);
+  transition: box-shadow .2s;
+  user-select: text;
+}
+.lg-input::placeholder { color: var(--text-3); }
+.lg-input:focus { box-shadow: inset 0 1px 2px rgba(0, 0, 0, .4), 0 0 0 2px var(--accent-ring); }
+
+/* 细进度条 */
+.lg-meter { position: relative; height: 4px; border-radius: 2px; background: rgba(255, 255, 255, .10); overflow: hidden; }
+.lg-meter > i { position: absolute; inset: 0 auto 0 0; border-radius: inherit; background: var(--accent); transition: width .4s var(--ease-out); }
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, .16); border-radius: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* 出现动效 */
+@keyframes lg-rise { from { opacity: 0; transform: translateY(6px) scale(.985); } to { opacity: 1; transform: none; } }
+.lg-rise { animation: lg-rise .35s var(--ease-out) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+}
+/* 性能模式：关模糊，只留半透明 + 高光边，观感八成不变 */
+:root.lg-lite .lg-card { backdrop-filter: none; }
+:root.lg-lite .lg-backdrop { filter: none; }

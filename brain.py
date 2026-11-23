@@ -5,6 +5,10 @@
 玩法风格：
 - 爽：清屏快、伤害高、奖励大。挑战按「敢接多大的危险」挑奖励最好的，赢了胆子变大，输了收一收。
 - 稳：一切求稳，挑战只接最安全的。
+
+长远：按波次分前期（1~10）/ 中期（11~20）/ 后期（21+）。前期赚钱、成长类加分（越早拿越值），后期赚钱类几乎不值钱、
+保命类加分；选定的流派核心技能 / 遗物额外加分，主动格满了还拿非核心主动会顶掉已有技能，扣分；
+上一波压力值顶得很高，挑战就收一收。
 """
 from __future__ import annotations
 
@@ -72,8 +76,19 @@ class Brain:
         self.tags: Counter = Counter()
         self.skills: list[str] = []
         self.relics: list[str] = []
+        self.actives: list[str] = []  # 学到的主动技能，按顺序就是 Q / E / R
         self.risk = 3                 # 爽模式下敢接的挑战危险等级（D=1 … SSS=7），会随输赢变化
-        self.ai_plan: dict = {}       # AI 给的本局路线
+        self.ai_plan: dict = {}       # 选定的流派（攻略库或 AI）
+        self.wave = 0
+
+    @property
+    def stage(self) -> str:
+        return "early" if self.wave <= 10 else "mid" if self.wave <= 20 else "late"
+
+    def after_wave(self, peak_pressure: float | None):
+        """一波打完：压力值差点爆了就别再接大挑战。"""
+        if peak_pressure is not None and peak_pressure > 0.75:
+            self.risk = max(1, self.risk - 1)
 
     # ------------------------------------------------ 流派
 
@@ -96,8 +111,10 @@ class Brain:
             return "magic"
 
     def _plan_style(self) -> str:
-        """选了 AI 流派就按流派走：看它的核心主动技能是法术、物理还是召唤居多。"""
+        """选了流派就按流派走：攻略库直接写了 style；AI 给的看名字和核心主动技能。"""
         plan = self.ai_plan or {}
+        if plan.get("style") in STYLE_NAME:
+            return plan["style"]
         name = plan.get("name", "")
         if "召唤" in name:
             return "summon"
@@ -125,6 +142,8 @@ class Brain:
         if entry and name not in self.skills:
             self.tags.update(entry["tags"])
             self.skills.append(name)
+            if kind == "active" and len(self.actives) < 3:
+                self.actives.append(name)
 
     def challenge_result(self, cleared: bool, danger: int):
         """挑战打过了就更敢，输了就收一收。"""
@@ -143,7 +162,7 @@ class Brain:
             return 0, ""
         b = base_skill(name)
         if any(w and (w == name or w == b or w in name or (kind == "relic" and w in desc)) for w in wanted):
-            return 4.0, "AI 路线核心"
+            return 4.0, "流派核心"
         return 0, ""
 
     # ------------------------------------------------ 打分（返回 分数, 理由）
@@ -167,12 +186,14 @@ class Brain:
                 break
         greed = [w for w in GREED_WORDS if w in text]
         if greed:
-            s += sum(GREED_WORDS[w] for w in greed) * (1.3 if self.playstyle == "爽" else 1.0)
-            why.append("赚钱 / 成长快")
+            k = {"early": 1.6, "mid": 0.9, "late": 0.3}[self.stage]
+            s += sum(GREED_WORDS[w] for w in greed) * (1.3 if self.playstyle == "爽" else 1.0) * k
+            why.append({"early": "前期拿，越早越赚", "mid": "赚钱 / 成长", "late": "后期赚钱没多大用"}[self.stage])
         defense = [w for w in DEFENSE_WORDS if w in text]
         if defense:
-            s += sum(DEFENSE_WORDS[w] for w in defense) * (0.7 if self.playstyle == "爽" else 1.6)
-            why.append("保命")
+            k = {"early": 0.8, "mid": 1.0, "late": 1.4}[self.stage]
+            s += sum(DEFENSE_WORDS[w] for w in defense) * (0.7 if self.playstyle == "爽" else 1.6) * k
+            why.append("保命" + ("（后期更要）" if self.stage == "late" else ""))
         for tag, word in ELEMENT_WORDS.items():
             if word in text and self.tags[tag]:
                 s += 1.5 + 0.5 * self.tags[tag]
@@ -182,7 +203,7 @@ class Brain:
             why.append("召唤流核心")
         return s, why
 
-    def score_active(self, name: str) -> tuple[float, list[str]]:
+    def score_active(self, name: str, replacing: bool = False) -> tuple[float, list[str]]:
         e = TABLES["active"].get(name)
         if not e:
             return 0, ["没认出这个技能"]
@@ -207,6 +228,10 @@ class Brain:
         if self.style == "physical" and "Magic" in tags and "Physical" not in tags:
             s -= 1
             why.append("物理流用法术技能吃不满加成")
+        core = [base_skill(c) for c in (self.ai_plan or {}).get("core_actives", [])]
+        if not replacing and len(self.actives) >= 3 and core and base_skill(name) not in core:
+            s -= 3
+            why.append("主动格满了，非核心会顶掉已有技能")
         return s, why
 
     def score_passive(self, name: str) -> tuple[float, list[str]]:
@@ -302,12 +327,96 @@ class Brain:
             else:
                 s, why = self.score_other(kind, name, c.get("desc", ""), c.get("rarity", ""))
             bonus, tip = self._ai_bonus(kind, name or "", c.get("desc", ""))
+            c["core"] = bool(bonus)
             if bonus:
                 s += bonus
                 why.insert(0, tip)
             c["score"] = round(s, 1)
             c["why"] = "，".join(dict.fromkeys(why)) or "没什么特别"
         return max(range(len(cards)), key=lambda i: cards[i]["score"])
+
+    # ------------------------------------------------ 刷新、替换技能（都按长线算）
+
+    def refresh_pick(self, kind: str, cards: list[dict], left: int | None, used: set[int], done: int) -> tuple[int | None, str]:
+        """三选一要不要刷新、刷哪张。只刷分最低的那张（本来就不会选它，换掉不亏），刷新次数是要省着用的资源。
+        left：剩余次数（None = 不知道）；used：这一屏已经刷过的卡；done：这一屏已经刷了几次。"""
+        if kind == "challenge" or len(cards) < 2 or done >= 2:
+            return None, ""
+        if any(c.get("core") and c.get("worth", True) for c in cards):
+            return None, "有流派核心，不用刷"
+        important = kind in ("active", "passive", "relic")
+        reserve = (1 if self.stage != "late" else 0) if important else 3   # 属性类只在次数多时刷
+        if left is not None and left <= reserve:
+            return None, f"刷新次数只剩 {left}，留着" if left else ""
+        if left is None and not important:
+            return None, ""
+        best = max(range(len(cards)), key=lambda i: cards[i]["score"])
+        cand = [i for i in range(len(cards)) if i != best and i not in used]
+        if not cand:
+            return None, ""
+        worst = min(cand, key=lambda i: cards[i]["score"])
+        return worst, f"三张都不是流派核心：刷新第 {worst + 1} 张（分最低，换掉不亏）"
+
+    def _active_value(self, n: str) -> float:
+        core = {base_skill(c) for c in (self.ai_plan or {}).get("core_actives", [])}
+        s, _ = self.score_active(n, replacing=True)
+        return s + (4.0 if base_skill(n) in core else 0)
+
+    def replace_gain(self, new: str, current: list[str]) -> tuple[int | None, float, str]:
+        """新主动技能能换掉格子里哪个：返回（格子, 提升多少, 理由）；不值得换格子为 None。
+        比格子里最差的那个明显更好才换；流派核心不会被非核心换掉；后期更谨慎（已有技能往往升过级）。"""
+        if not new or not current:
+            return None, 0.0, "不知道新技能是什么，放弃最稳"
+        nb = base_skill(new)
+        if any(base_skill(c) == nb for c in current):
+            return None, 0.0, f"已经有「{nb}」了"
+        core = {base_skill(c) for c in (self.ai_plan or {}).get("core_actives", [])}
+        new_v = self._active_value(new)
+        vals = [self._active_value(n) for n in current]
+        worst = min(range(len(current)), key=lambda i: (base_skill(current[i]) in core, vals[i]))
+        if base_skill(current[worst]) in core and nb not in core:
+            return None, 0.0, "格子里都是流派核心，不换"
+        gain = new_v - vals[worst]
+        margin = 1.5 if self.stage != "late" else 2.5
+        if gain > margin:
+            return worst, gain, f"比「{base_skill(current[worst])}」强"
+        return None, gain, "不比现有技能强多少"
+
+    def replace_pick(self, new: str, current: list[str]) -> tuple[int | None, str]:
+        """替换界面：换哪个格子，或放弃。和三选一时的判断用同一套，前后一致。"""
+        slot, _, why = self.replace_gain(new, current)
+        if slot is not None:
+            return slot, f"「{base_skill(new)}」{why}，换掉它"
+        return None, f"「{base_skill(new)}」{why}，放弃"
+
+    def plan_active_choice(self, cards: list[dict], current: list[str], keys: list[str], full: bool) -> tuple[int | None, str]:
+        """主动技能三选一：每张卡写上拿了之后的结果（放进空格 / 替换哪个 / 不如现有），返回（推荐第几张, 总结）。
+        技能格满了、三张都不值得换时不推荐（返回 None）：随便点一张，替换界面点放弃。"""
+        best = max(range(len(cards)), key=lambda i: cards[i]["score"])
+        if not full:
+            free = keys[len(current)] if len(current) < len(keys) else ""
+            for c in cards:
+                c["replace"] = f"拿了放进空格 {free.upper()}" if free else "拿了放进空格"
+            weak = not cards[best].get("core") and cards[best]["score"] < 14
+            return best, ("三张都一般，先拿它占格，以后遇到更好的再换" if weak else "")
+        if len(current) < len(keys):
+            for c in cards:
+                c["replace"] = "技能格满了，但我不清楚格子里是什么"
+            return best, "技能格里有我没记下的技能，到替换界面自己决定换哪个"
+        pick, pick_gain = None, 0.0
+        for i, c in enumerate(cards):
+            slot, gain, why = self.replace_gain(c.get("matched", ""), current)
+            c["worth"] = slot is not None
+            if slot is not None:
+                c["replace"] = f"拿它 → 替换 {keys[slot].upper()}「{base_skill(current[slot])}」（{why}）"
+                if pick is None or gain > pick_gain:
+                    pick, pick_gain = i, gain
+            else:
+                c["replace"] = f"不值得拿：{why}"
+        if pick is None:
+            have = "、".join(f"{k.upper()} {base_skill(n)}" for k, n in zip(keys, current))
+            return None, f"三张都不如现有技能（{have}）：不推荐，随便点一张，替换时点「放弃」"
+        return pick, ""
 
     # ------------------------------------------------ 出装 / 商店
 
@@ -338,7 +447,10 @@ class Brain:
         elif not free_equip:
             tips.append("装备格满了")
         left = gold - (2500 if free_equip and wish and gold >= 2500 else 0)
-        if left >= 450 and (not free_equip or not wish or gold < 2500 or left >= 950):
+        saving = free_equip and wish and gold < 2500 and self.stage != "late"
+        if saving:
+            tips.append("金币先攒着买核心装备，别全花在锻造器上（长线更赚）")
+        elif left >= 450:
             tips.append(f"剩下的金币买属性锻造器（约 {max(left // 450 - 1, 1)} 个）")
         if self.playstyle == "爽":
             letters = {v: k for k, v in DANGER_RANK.items()}
